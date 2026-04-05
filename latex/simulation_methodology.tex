@@ -21,7 +21,7 @@
   \item 将城市抽象为 $r\times c$ 的\textbf{网格图}：每个交叉点为一个顶点，四邻连接（上下左右）。
   \item 边权为相邻顶点间的\textbf{欧氏距离}（网格轴相邻边权为 $1$）。
   \item 顶点按行主序编号，$0$ 号节点为\textbf{中央仓库（车场）}。
-  \item 使用 \textbf{Floyd--Warshall} 算法预处理\textbf{全对最短路}，调度时直接查表得到任意两点间最短距离。
+  \item 使用 \textbf{Dijkstra} 单源最短路；从某顶点出发的距离行按需计算并\textbf{缓存}，路径由父指针回溯得到（大图避免 Floyd 的 $O(|V|^3)$）。
 \end{itemize}
 
 \subsection{时间推进与任务生成}
@@ -33,22 +33,24 @@
 
 \subsection{车队与能耗}
 \begin{itemize}
-  \item 每辆车有\textbf{电量上限} $B_{\max}$、\textbf{载重上限} $L_{\max}$；任务完成后载重释放。
+  \item 每辆车有\textbf{电量上限} $B_{\max}$、\textbf{载重上限} $L_{\max}$；每完成一票配送，车上对应载重释放。
   \item 行驶距离 $d$ 的能耗近似为 $E(d)=\rho\cdot d$，其中 $\rho$ 为\textbf{单位距离能耗}。
   \item 车速用于将距离换算为行驶时间：$t_{\mathrm{travel}} = d / v$。
 \end{itemize}
 
-\subsection{调度策略：最大任务（重量）优先}
-在仓库且空闲的车辆，在待分配任务集合上做贪心选择：
+\subsection{调度策略：仓库多票装车 $+$ 最近邻配送顺序}
+车辆\textbf{仅在仓库}且空闲时派发新的一批任务（代码中 \texttt{node} 为仓库且无在送批次）。模型假定\textbf{所有货物在仓库一次装车}，再沿路连续送票，\textbf{本批全部送完后}再执行回仓（与“每送一票必须先回仓”不同）。具体为：
 \begin{enumerate}
-  \item 仅考虑已出现、未过期、且\textbf{当前载重加上该任务重量不超过 $L_{\max}$} 的任务；
-  \item 在其中选取\textbf{货物重量最大}的任务。
+  \item \textbf{装车（贪心）}：在待分配、已出现且未过期的任务中，按\textbf{重量从大到小}依次装入，直至再加一票会超过 $L_{\max}$，得到本趟\textbf{批次}（可多票）。
+  \item \textbf{配送顺序（最近邻）}：以仓库为起点，在批次内反复选择\textbf{距当前位置图最短路最短}的下一配送点，直至排完访问序（启发式，非最优 TSP）。
+  \item \textbf{电量可行性}：计算\textbf{仓库 $\to$ 各配送点（按上述顺序）$\to$ 回仓库} 的总路程能耗；若超过当前电量，则反复从批次中\textbf{去掉当前最轻的一票}并重新最近邻排序，直至总能耗不超过电量，或批次退化为\textbf{仅一票}（仍不足则允许经充电站补能，逻辑见下节）。
+  \item \textbf{在途}：按访问序分段行驶；每一段均为“当前位置 $\to$ 下一配送点”，段内仍可采用途经充电站路径。每送完一票仅卸下该票重量；若尚有余票，则\textbf{从当前配送点直接}驶向下一点，无需回仓。
 \end{enumerate}
-送完货后车辆先\textbf{回仓}再接受下一单。
+代码中另保留单票选取函数 \texttt{pick\_task\_max\_weight}，便于与“只装一票”等策略做对比，主流程为 \texttt{pick\_batch\_greedy\_max\_weight}。
 
 \subsection{充电与排队}
 \begin{itemize}
-  \item 若从当前位置沿最短路直达任务点（或回仓）的能耗超过当前电量，则先到\textbf{图距离最近}的充电站，充电后再继续路段。
+  \item 对\textbf{每一段}行驶（含首段出仓、批次内相邻配送点之间、以及送完本批后的回仓段），若沿最短路直达的能耗超过当前电量，则先到\textbf{图距离最近}的充电站补能后再继续该段。
   \item 每个充电站有有限个\textbf{并发槽位}（代码中为 $2$）。充电用时间区间 $[t_{\mathrm{start}},t_{\mathrm{end}})$ 预约；槽位已满时推进到\textbf{最早能开始充电的时刻}，体现\textbf{排队与负荷}。
 \end{itemize}
 
@@ -56,10 +58,10 @@
 
 四组场景除下表所列参数外，还共享：
 \[
-B_{\max}=100,\quad L_{\max}=50,\quad \rho=0.8,\quad v=1.0,\quad P_{\mathrm{charge}}=15.0,
+B_{\max}=500,\quad L_{\max}=250,\quad \rho=0.8,\quad v=1.0,\quad P_{\mathrm{charge}}=75.0,
 \]
 \[
-\alpha_{\mathrm{early}}=2.0,\quad \alpha_{\mathrm{late}}=3.0,\quad \alpha_{d}=0.05.
+\alpha_{\mathrm{early}}=10.0,\quad \alpha_{\mathrm{late}}=15.0,\quad \alpha_{d}=0.01.
 \]
 充电站每站点并发槽位数为 $2$。
 
@@ -72,15 +74,16 @@ B_{\max}=100,\quad L_{\max}=50,\quad \rho=0.8,\quad v=1.0,\quad P_{\mathrm{charg
     名称 & $r$ & $c$ & $|V|=rc$ & 车辆数 & 充电站数 & $T_{\mathrm{sim}}$ &
     $p_{\mathrm{spawn}}$ & 重量区间 & 截止裕量区间 & \texttt{seed} \\
     \midrule
-    SMALL      & 5  & 5  & 25   & 2 & 2 & 200 & 0.08 & $[1,8]$   & $[25,55]$ & 1 \\
-    MEDIUM     & 10 & 10 & 100  & 4 & 4 & 300 & 0.12 & $[1,15]$  & $[20,60]$ & 2 \\
-    LARGE      & 16 & 16 & 256  & 8 & 8 & 400 & 0.15 & $[2,25]$  & $[18,50]$ & 3 \\
-    XL\_STRESS & 20 & 20 & 400  & 6 & 5 & 350 & 0.22 & $[3,30]$  & $[12,35]$ & 4 \\
+    SMALL      & 25 & 25 & 625   & 10 & 10 & 1000 & 0.40 & $[5,40]$   & $[125,275]$ & 1 \\
+    MEDIUM     & 50 & 50 & 2500  & 20 & 20 & 1500 & 0.60 & $[5,75]$   & $[100,300]$ & 2 \\
+    LARGE      & 80 & 80 & 6400  & 40 & 40 & 2000 & 0.75 & $[10,125]$ & $[90,250]$ & 3 \\
+    XL\_STRESS & 100 & 100 & 10000 & 30 & 25 & 1750 & 1.10 & $[15,150]$ & $[60,175]$ & 4 \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-\noindent\textbf{说明：} $|V|$ 为顶点数；边数约为 $2rc-r-c$。XL\_STRESS 采用更高到达率、更紧截止裕量、相对较少车辆/充电站，用于压力测试。
+\noindent\textbf{说明：} $|V|$ 为顶点数；边数约为 $2rc-r-c$。
+\textbf{XL\_STRESS} 为第四档场景名称：\textbf{XL} 表示网格规模最大（$100\times 100$）；\textbf{STRESS} 表示相对同规模地图\textbf{加压}——任务到达率 $p_{\mathrm{spawn}}$ 更高、截止裕量区间更紧、车辆与充电站数量相对偏少，用于观察调度在拥堵、易超时情形下的表现，与前三档“常规规模”形成对照。
 
 \section{最终得分的含义与计算公式}
 
@@ -88,6 +91,7 @@ B_{\max}=100,\quad L_{\max}=50,\quad \rho=0.8,\quad v=1.0,\quad P_{\mathrm{charg
 
 \subsection{已完成任务的贡献}
 设任务在 $t_{\mathrm{fin}}$ 完成，截止 $t_{\mathrm{dl}}$，重量 $w$，本任务相关行驶距离为 $d_{\mathrm{task}}$。
+多票同车时，$d_{\mathrm{task}}$ 取\textbf{送达该票的这一小段路}的最短路长度（上一停靠点 $\to$ 该任务顶点，若经充电站则含充电前路段的计程方式与代码 \texttt{travel\_distance} 一致），而非整趟多点的总里程。
 \begin{equation}
   \Delta S_{\mathrm{done}} =
   \begin{cases}
@@ -111,6 +115,6 @@ B_{\max}=100,\quad L_{\max}=50,\quad \rho=0.8,\quad v=1.0,\quad P_{\mathrm{charg
 
 \section{小结}
 
-网格图 $+$ 全对最短路、离散时间动态任务、最大重量优先贪心、充电站槽位与区间预约，以及按时奖励、迟到/过期惩罚、距离惩罚构成总分 $S$。与代码不一致处以 \texttt{fleet\_simulation.py} 为准。
+网格图 $+$ Dijkstra（行缓存）、离散时间动态任务、\textbf{仓库多票装车（重量贪心）与最近邻配送序、送完一批再回仓}、分段路径下的充电站槽位与区间预约，以及按时奖励、迟到/过期惩罚、按段路程惩罚构成总分 $S$。与代码不一致处以 \texttt{fleet\_simulation.py} 为准。
 
 \end{document}
