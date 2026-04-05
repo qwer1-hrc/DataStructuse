@@ -2,51 +2,59 @@
 新能源物流车队协同调度 — 图结构道路 + 最短路径 + 最大任务（重量）优先策略
 
 大作业要求要点（本实现覆盖）：
-- 图表示道路，Dijkstra 寻路
+- 图表示道路，Dijkstra 最短路（按源点缓存距离行）
 - 车队规模、电量上限、载重上限；任务动态到达（时间、节点、重量随机）
 - 评分：越早完成、路径越短越高；超时扣分
 - 电量不足时前往充电站；充电站排队与并发槽位（负荷）
 - 至少三种不同规模场景（SMALL / MEDIUM / LARGE）
 
-策略：MAX_WEIGHT_FIRST（最大任务优先）。最近任务优先可另写策略函数对比。
+策略：仓库按载重贪心装多票（重量大优先装车），最近邻排配送顺序；同一车次送完再回仓。单任务函数 pick_task_max_weight 保留便于改策略对比。
 """
 
 from __future__ import annotations
 
+import heapq
 import math
 import random
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 # ---------------------------- 图与最短路 ----------------------------
 
 
-def all_pairs_shortest_paths(
-    n: int, adj: List[List[Tuple[int, float]]]
-) -> Tuple[List[List[float]], List[List[int]]]:
-    """Floyd–Warshall，返回 dist 与 nxt（重构路径用，-1 表示无后继）。"""
-    dist = [[math.inf] * n for _ in range(n)]
-    nxt = [[-1] * n for _ in range(n)]
-    for u in range(n):
-        dist[u][u] = 0.0
-    for u in range(n):
+def dijkstra(
+    n: int, adj: List[List[Tuple[int, float]]], src: int
+) -> Tuple[List[float], List[int]]:
+    """单源最短路；parent[v] 为树边父节点，src 处为 -1。"""
+    dist = [math.inf] * n
+    parent = [-1] * n
+    dist[src] = 0.0
+    pq: List[Tuple[float, int]] = [(0.0, src)]
+    while pq:
+        d, u = heapq.heappop(pq)
+        if d > dist[u]:
+            continue
         for v, w in adj[u]:
-            if w < dist[u][v]:
-                dist[u][v] = w
-                nxt[u][v] = v
-    for k in range(n):
-        for i in range(n):
-            if dist[i][k] == math.inf:
-                continue
-            for j in range(n):
-                if dist[k][j] == math.inf:
-                    continue
-                if dist[i][j] > dist[i][k] + dist[k][j]:
-                    dist[i][j] = dist[i][k] + dist[k][j]
-                    nxt[i][j] = nxt[i][k]
-    return dist, nxt
+            nd = d + w
+            if nd < dist[v]:
+                dist[v] = nd
+                parent[v] = u
+                heapq.heappush(pq, (nd, v))
+    return dist, parent
+
+
+def path_from_parent(parent: List[int], src: int, dst: int) -> List[int]:
+    if dst < 0 or src < 0 or dst >= len(parent):
+        return []
+    if parent[dst] == -1 and dst != src:
+        return []
+    path = [dst]
+    while path[-1] != src:
+        path.append(parent[path[-1]])
+    path.reverse()
+    return path
 
 
 def build_grid_graph(rows: int, cols: int) -> Tuple[int, List[List[Tuple[int, float]]]]:
@@ -99,6 +107,11 @@ class Vehicle:
     load_used: float
     busy_until: float = 0.0
     current_task: Optional[int] = None
+    # 在仓库一次装车、按序连续配送的订单 id；current_task 与 carry_batch[batch_index] 一致
+    carry_batch: List[int] = field(default_factory=list)
+    batch_index: int = 0
+    # (段开始时刻, 段结束时刻, 路径顶点序列)；单点或两点相同表示在节点等待（如充电）
+    visual_segments: List[Tuple[float, float, List[int]]] = field(default_factory=list)
 
 
 @dataclass
@@ -165,19 +178,37 @@ def pick_task_max_weight(
     return best
 
 
-def nearest_charger_node(
-    chargers: Sequence[ChargingStation],
-    dist: Sequence[Sequence[float]],
-    from_node: int,
-) -> Optional[int]:
-    best_n: Optional[int] = None
-    best_d = math.inf
-    for cs in chargers:
-        d = dist[from_node][cs.node]
-        if d < best_d:
-            best_d = d
-            best_n = cs.node
-    return best_n
+def _eligible_pending(pending: Iterable[Task], now: float) -> List[Task]:
+    out: List[Task] = []
+    for t in pending:
+        if t.status != TaskStatus.PENDING:
+            continue
+        if t.spawn_time > now:
+            continue
+        if now > t.deadline:
+            continue
+        out.append(t)
+    return out
+
+
+def pick_batch_greedy_max_weight(
+    pending: Iterable[Task],
+    now: float,
+    load_cap: float,
+    load_already: float = 0.0,
+) -> List[Task]:
+    """在载重上限内按重量从大到小贪心装入多个任务（假定均在仓库装货）。"""
+    cand = sorted(
+        _eligible_pending(pending, now),
+        key=lambda x: -x.weight,
+    )
+    batch: List[Task] = []
+    wsum = load_already
+    for t in cand:
+        if wsum + t.weight <= load_cap + 1e-9:
+            batch.append(t)
+            wsum += t.weight
+    return batch
 
 
 # ---------------------------- 仿真核心 ----------------------------
@@ -189,7 +220,7 @@ class FleetSimulator:
         random.seed(cfg.seed)
         self.n, self.adj = build_grid_graph(cfg.rows, cfg.cols)
         self.depot = 0
-        self.dist, self.nxt = all_pairs_shortest_paths(self.n, self.adj)
+        self._dist_row_cache: Dict[int, Tuple[List[float], List[int]]] = {}
 
         self.tasks: Dict[int, Task] = {}
         self._next_tid = 0
@@ -208,6 +239,15 @@ class FleetSimulator:
 
         self.chargers = self._place_chargers(cfg.num_chargers)
         self.score = 0.0
+
+    def _ensure_dijkstra(self, src: int) -> Tuple[List[float], List[int]]:
+        if src not in self._dist_row_cache:
+            self._dist_row_cache[src] = dijkstra(self.n, self.adj, src)
+        return self._dist_row_cache[src]
+
+    def dist_uv(self, u: int, v: int) -> float:
+        d, _ = self._ensure_dijkstra(u)
+        return d[v]
 
     def _place_chargers(self, k: int) -> List[ChargingStation]:
         """在图中均匀撒点充电站（避开 depot）。"""
@@ -287,45 +327,74 @@ class FleetSimulator:
         for cs in self.chargers:
             cs.active = [s for s in cs.active if s.until > now]
 
-    def _assign_vehicle(self, v: Vehicle, now: float) -> None:
-        if v.node != self.depot:
-            return
-        pending = [t for t in self.tasks.values() if t.status == TaskStatus.PENDING]
-        task = pick_task_max_weight(pending, v, now, self.cfg.load_capacity)
-        if task is None:
-            return
+    def _path_nodes(self, u: int, v: int) -> List[int]:
+        _, parent = self._ensure_dijkstra(u)
+        return path_from_parent(parent, u, v)
 
-        d_direct = self.dist[v.node][task.node]
+    def _order_tasks_nn(self, start_node: int, tasks: List[Task]) -> List[Task]:
+        """从 start_node 出发，最近邻次序排列配送点。"""
+        remaining = list(tasks)
+        ordered: List[Task] = []
+        cur = start_node
+        while remaining:
+            best_t = min(remaining, key=lambda t: (self.dist_uv(cur, t.node), t.tid))
+            ordered.append(best_t)
+            remaining.remove(best_t)
+            cur = best_t.node
+        return ordered
+
+    def _tour_distance_with_return(self, stop_nodes: List[int]) -> float:
+        """仓库 → 各配送点（按 stop_nodes 顺序）→ 回仓库 的总路程。"""
+        if not stop_nodes:
+            return 0.0
+        seq = [self.depot] + list(stop_nodes) + [self.depot]
+        s = 0.0
+        for i in range(len(seq) - 1):
+            d = self.dist_uv(seq[i], seq[i + 1])
+            if math.isinf(d):
+                return math.inf
+            s += d
+        return s
+
+    def _begin_leg_from_to(
+        self,
+        v: Vehicle,
+        now: float,
+        from_node: int,
+        to_node: int,
+        record_tid: Optional[int],
+    ) -> bool:
+        """执行一段 from_node→to_node 的行驶（可含充电）。成功则更新 busy_until、电量、位置、可视化。"""
+        d_direct = self.dist_uv(from_node, to_node)
         if math.isinf(d_direct):
-            return
+            return False
 
         need_direct = self._energy_need(d_direct)
         if need_direct <= v.battery + 1e-9:
             travel_t = self._travel_time(d_direct)
+            p = self._path_nodes(from_node, to_node)
+            v.visual_segments = [(now, now + travel_t, p)] if p else []
             v.battery -= need_direct
-            v.node = task.node
-            v.load_used += task.weight
+            v.node = to_node
             v.busy_until = now + travel_t
-            task.status = TaskStatus.ASSIGNED
-            task.assigned_vehicle = v.vid
-            task.travel_distance = d_direct
-            v.current_task = task.tid
-            return
+            if record_tid is not None:
+                self.tasks[record_tid].travel_distance = d_direct
+            return True
 
-        cnode = nearest_charger_node(self.chargers, self.dist, v.node)
+        cnode = nearest_charger_node(self.chargers, self, from_node)
         if cnode is None:
-            return
-        d1 = self.dist[v.node][cnode]
-        d2 = self.dist[cnode][task.node]
+            return False
+        d1 = self.dist_uv(from_node, cnode)
+        d2 = self.dist_uv(cnode, to_node)
         if math.isinf(d1) or math.isinf(d2):
-            return
+            return False
         e1 = self._energy_need(d1)
         if e1 > v.battery + 1e-9:
-            return
+            return False
 
         station = self._station_on_node(cnode)
         if station is None:
-            return
+            return False
 
         t_arrive_c = now + self._travel_time(d1)
         bat_after_leg1 = v.battery - e1
@@ -334,18 +403,71 @@ class FleetSimulator:
         e2 = self._energy_need(d2)
         if e2 > bat_after + 1e-9:
             self._cancel_last_session(station)
-            return
+            return False
 
         travel2 = self._travel_time(d2)
         arrive_task = charge_end + travel2
+        p1 = self._path_nodes(from_node, cnode)
+        p2 = self._path_nodes(cnode, to_node)
+        v.visual_segments = []
+        if p1:
+            v.visual_segments.append((now, t_arrive_c, p1))
+        v.visual_segments.append((t_arrive_c, charge_end, [cnode, cnode]))
+        if p2:
+            v.visual_segments.append((charge_end, arrive_task, p2))
         v.battery = bat_after - e2
-        v.node = task.node
-        v.load_used += task.weight
+        v.node = to_node
         v.busy_until = arrive_task
-        task.status = TaskStatus.ASSIGNED
-        task.assigned_vehicle = v.vid
-        task.travel_distance = d1 + d2
-        v.current_task = task.tid
+        if record_tid is not None:
+            self.tasks[record_tid].travel_distance = d1 + d2
+        return True
+
+    def _rollback_batch(self, v: Vehicle, tids: List[int]) -> None:
+        for tid in tids:
+            self.tasks[tid].status = TaskStatus.PENDING
+            self.tasks[tid].assigned_vehicle = None
+        v.carry_batch = []
+        v.batch_index = 0
+        v.current_task = None
+        v.load_used = 0.0
+        v.visual_segments = []
+
+    def _assign_vehicle(self, v: Vehicle, now: float) -> None:
+        if v.node != self.depot:
+            return
+        if v.carry_batch:
+            return
+        pending = [t for t in self.tasks.values() if t.status == TaskStatus.PENDING]
+        raw = pick_batch_greedy_max_weight(
+            pending, now, self.cfg.load_capacity, load_already=0.0
+        )
+        if not raw:
+            return
+
+        ordered = self._order_tasks_nn(self.depot, raw)
+        while len(ordered) > 1:
+            tour_d = self._tour_distance_with_return([t.node for t in ordered])
+            if self._energy_need(tour_d) <= v.battery + 1e-9:
+                break
+            drop = min(ordered, key=lambda t: (t.weight, t.tid))
+            ordered.remove(drop)
+            ordered = self._order_tasks_nn(self.depot, ordered)
+        if not ordered:
+            return
+
+        tids = [t.tid for t in ordered]
+        for t in ordered:
+            t.status = TaskStatus.ASSIGNED
+            t.assigned_vehicle = v.vid
+
+        v.carry_batch = tids
+        v.batch_index = 0
+        v.current_task = tids[0]
+        v.load_used = sum(self.tasks[tid].weight for tid in tids)
+
+        first = self.tasks[tids[0]]
+        if not self._begin_leg_from_to(v, now, v.node, first.node, first.tid):
+            self._rollback_batch(v, tids)
 
     def _complete_task_if_due(self, v: Vehicle, now: float) -> None:
         if v.current_task is None:
@@ -356,7 +478,6 @@ class FleetSimulator:
         task.finish_time = now
         task.status = TaskStatus.DONE
         v.load_used -= task.weight
-        v.current_task = None
         cfg = self.cfg
         if now <= task.deadline:
             self.score += cfg.early_bonus_per_weight * task.weight
@@ -364,24 +485,49 @@ class FleetSimulator:
             self.score -= cfg.late_penalty_per_time * (now - task.deadline)
         self.score -= cfg.distance_penalty_coef * task.travel_distance
 
+        v.batch_index += 1
+        if v.batch_index < len(v.carry_batch):
+            next_tid = v.carry_batch[v.batch_index]
+            v.current_task = next_tid
+            nt = self.tasks[next_tid]
+            if not self._begin_leg_from_to(v, now, v.node, nt.node, next_tid):
+                for j in range(v.batch_index, len(v.carry_batch)):
+                    tj = self.tasks[v.carry_batch[j]]
+                    if tj.status == TaskStatus.ASSIGNED:
+                        tj.status = TaskStatus.PENDING
+                        tj.assigned_vehicle = None
+                        v.load_used -= tj.weight
+                v.carry_batch = []
+                v.batch_index = 0
+                v.current_task = None
+                v.visual_segments = []
+        else:
+            v.carry_batch = []
+            v.batch_index = 0
+            v.current_task = None
+            v.visual_segments = []
+
     def _return_depot(self, v: Vehicle, now: float) -> None:
         if v.node == self.depot:
             return
-        d_back = self.dist[v.node][self.depot]
+        d_back = self.dist_uv(v.node, self.depot)
         if math.isinf(d_back):
             return
         need = self._energy_need(d_back)
         if need <= v.battery + 1e-9:
+            tr = self._travel_time(d_back)
+            p = self._path_nodes(v.node, self.depot)
+            v.visual_segments = [(now, now + tr, p)] if p else []
             v.battery -= need
             v.node = self.depot
-            v.busy_until = now + self._travel_time(d_back)
+            v.busy_until = now + tr
             return
 
-        cnode = nearest_charger_node(self.chargers, self.dist, v.node)
+        cnode = nearest_charger_node(self.chargers, self, v.node)
         if cnode is None:
             return
-        d1 = self.dist[v.node][cnode]
-        d2 = self.dist[cnode][self.depot]
+        d1 = self.dist_uv(v.node, cnode)
+        d2 = self.dist_uv(cnode, self.depot)
         if math.isinf(d1) or math.isinf(d2):
             return
         e1 = self._energy_need(d1)
@@ -398,99 +544,134 @@ class FleetSimulator:
         if e2 > bat_after + 1e-9:
             self._cancel_last_session(station)
             return
+        p1 = self._path_nodes(v.node, cnode)
+        p2 = self._path_nodes(cnode, self.depot)
+        t_end = charge_end + self._travel_time(d2)
+        v.visual_segments = []
+        if p1:
+            v.visual_segments.append((now, t_arrive_c, p1))
+        v.visual_segments.append((t_arrive_c, charge_end, [cnode, cnode]))
+        if p2:
+            v.visual_segments.append((charge_end, t_end, p2))
         v.battery = bat_after - e2
         v.node = self.depot
-        v.busy_until = charge_end + self._travel_time(d2)
+        v.busy_until = t_end
+
+    def step(self, t: float, dt: float) -> None:
+        """推进一个仿真时间步（供可视化逐步调用）。"""
+        cfg = self.cfg
+        if self._rng.random() < cfg.task_spawn_rate * dt:
+            self._spawn_task(t)
+
+        self._tick_chargers(t)
+
+        for v in self.vehicles:
+            self._complete_task_if_due(v, t)
+            if v.busy_until <= t + 1e-9 and v.current_task is None:
+                self._return_depot(v, t)
+
+        for v in self.vehicles:
+            if v.busy_until <= t + 1e-9 and v.current_task is None:
+                self._assign_vehicle(v, t)
+
+        for task in self.tasks.values():
+            if task.status == TaskStatus.PENDING and t > task.deadline:
+                task.status = TaskStatus.EXPIRED
+                self.score -= cfg.late_penalty_per_time * (t - task.deadline)
+
+        for v in self.vehicles:
+            if (
+                v.node == self.depot
+                and v.busy_until <= t + 1e-9
+                and v.current_task is None
+            ):
+                v.visual_segments = []
 
     def run(self) -> None:
-        cfg = self.cfg
         t = 0.0
         dt = 0.5
-        while t <= cfg.sim_duration:
-            if self._rng.random() < cfg.task_spawn_rate * dt:
-                self._spawn_task(t)
-
-            self._tick_chargers(t)
-
-            for v in self.vehicles:
-                self._complete_task_if_due(v, t)
-                if v.busy_until <= t + 1e-9 and v.current_task is None:
-                    self._return_depot(v, t)
-
-            for v in self.vehicles:
-                if v.busy_until <= t + 1e-9 and v.current_task is None:
-                    self._assign_vehicle(v, t)
-
-            for task in self.tasks.values():
-                if task.status == TaskStatus.PENDING and t > task.deadline:
-                    task.status = TaskStatus.EXPIRED
-                    self.score -= cfg.late_penalty_per_time * (t - task.deadline)
-
+        while t <= self.cfg.sim_duration:
+            self.step(t, dt)
             t += dt
 
 
+def nearest_charger_node(
+    chargers: Sequence[ChargingStation],
+    sim: FleetSimulator,
+    from_node: int,
+) -> Optional[int]:
+    best_n: Optional[int] = None
+    best_d = math.inf
+    for cs in chargers:
+        d = sim.dist_uv(from_node, cs.node)
+        if d < best_d:
+            best_d = d
+            best_n = cs.node
+    return best_n
+
+
 def preset_scenarios() -> List[SimConfig]:
-    """三种以上不同规模。"""
+    """三种以上不同规模（网格边长及配套参数相对初版 ×5）。"""
     base = dict(
-        battery_capacity=100.0,
-        load_capacity=50.0,
+        battery_capacity=500.0,
+        load_capacity=250.0,
         energy_per_distance=0.8,
         travel_speed=1.0,
-        charge_power=15.0,
-        early_bonus_per_weight=2.0,
-        late_penalty_per_time=3.0,
-        distance_penalty_coef=0.05,
+        charge_power=75.0,
+        early_bonus_per_weight=10.0,
+        late_penalty_per_time=15.0,
+        distance_penalty_coef=0.01,
     )
     return [
         SimConfig(
             name="SMALL",
-            rows=5,
-            cols=5,
-            num_vehicles=2,
-            num_chargers=2,
-            sim_duration=200.0,
-            task_spawn_rate=0.08,
-            weight_range=(1.0, 8.0),
-            deadline_slack_range=(25.0, 55.0),
+            rows=25,
+            cols=25,
+            num_vehicles=10,
+            num_chargers=10,
+            sim_duration=1000.0,
+            task_spawn_rate=0.40,
+            weight_range=(5.0, 40.0),
+            deadline_slack_range=(125.0, 275.0),
             **base,
             seed=1,
         ),
         SimConfig(
             name="MEDIUM",
-            rows=10,
-            cols=10,
-            num_vehicles=4,
-            num_chargers=4,
-            sim_duration=300.0,
-            task_spawn_rate=0.12,
-            weight_range=(1.0, 15.0),
-            deadline_slack_range=(20.0, 60.0),
+            rows=50,
+            cols=50,
+            num_vehicles=20,
+            num_chargers=20,
+            sim_duration=1500.0,
+            task_spawn_rate=0.60,
+            weight_range=(5.0, 75.0),
+            deadline_slack_range=(100.0, 300.0),
             **base,
             seed=2,
         ),
         SimConfig(
             name="LARGE",
-            rows=16,
-            cols=16,
-            num_vehicles=8,
-            num_chargers=8,
-            sim_duration=400.0,
-            task_spawn_rate=0.15,
-            weight_range=(2.0, 25.0),
-            deadline_slack_range=(18.0, 50.0),
+            rows=80,
+            cols=80,
+            num_vehicles=40,
+            num_chargers=40,
+            sim_duration=2000.0,
+            task_spawn_rate=0.75,
+            weight_range=(10.0, 125.0),
+            deadline_slack_range=(90.0, 250.0),
             **base,
             seed=3,
         ),
         SimConfig(
             name="XL_STRESS",
-            rows=20,
-            cols=20,
-            num_vehicles=6,
-            num_chargers=5,
-            sim_duration=350.0,
-            task_spawn_rate=0.22,
-            weight_range=(3.0, 30.0),
-            deadline_slack_range=(12.0, 35.0),
+            rows=100,
+            cols=100,
+            num_vehicles=30,
+            num_chargers=25,
+            sim_duration=1750.0,
+            task_spawn_rate=1.10,
+            weight_range=(15.0, 150.0),
+            deadline_slack_range=(60.0, 175.0),
             **base,
             seed=4,
         ),
