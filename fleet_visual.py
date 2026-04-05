@@ -16,7 +16,7 @@ def _interp_on_path(
     t1: float,
     path: list[int],
     now: float,
-    dist: list[list[float]],
+    dist_uv,
     cxy,
 ) -> tuple[float, float]:
     if not path:
@@ -29,7 +29,7 @@ def _interp_on_path(
         return cxy(path[-1])
     if len(path) == 1 or path[0] == path[-1]:
         return cxy(path[0])
-    total_d = sum(dist[path[i]][path[i + 1]] for i in range(len(path) - 1))
+    total_d = sum(dist_uv(path[i], path[i + 1]) for i in range(len(path) - 1))
     if total_d < 1e-9:
         return cxy(path[0])
     frac = (now - t0) / (t1 - t0)
@@ -37,7 +37,7 @@ def _interp_on_path(
     acc = 0.0
     for i in range(len(path) - 1):
         a, b = path[i], path[i + 1]
-        d = dist[a][b]
+        d = dist_uv(a, b)
         if acc + d >= target_d - 1e-9:
             alpha = (target_d - acc) / d if d > 1e-9 else 0.0
             x0, y0 = cxy(a)
@@ -53,10 +53,9 @@ def _vehicle_xy(
     now: float,
     cxy,
 ) -> tuple[float, float]:
-    dist = sim.dist
     for t0, t1, path in v.visual_segments:
         if t0 - 1e-9 <= now <= t1 + 1e-9:
-            return _interp_on_path(t0, t1, path, now, dist, cxy)
+            return _interp_on_path(t0, t1, path, now, sim.dist_uv, cxy)
     return cxy(v.node)
 
 
@@ -84,8 +83,7 @@ class FleetVisualApp:
         self.t = 0.0
         self.dt = 0.5
         self.running = False
-        self.steps_per_tick = 2
-        self._trail_len = 140
+        self.steps_per_tick = 1
         self._trails: dict[int, deque[tuple[float, float]]] = {}
 
         self._colors = {
@@ -133,8 +131,8 @@ class FleetVisualApp:
 
         self.canvas = tk.Canvas(
             root,
-            width=960,
-            height=700,
+            width=1200,
+            height=820,
             bg=self._colors["bg"],
             highlightthickness=0,
         )
@@ -178,6 +176,20 @@ class FleetVisualApp:
         assert self.cfg is not None
         return node // self.cfg.cols, node % self.cfg.cols
 
+    def _erase_vehicle_path_if_idle_at_depot(self, sim: FleetSimulator, v) -> None:
+        """
+        本趟订单（含多票批次）送完并已回仓、且当前无在走路径段时，清空该车「已走轨迹」。
+        规划虚线由 sim 清空 visual_segments / 超时不再绘制；此处负责灰色尾迹 deque。
+        不设 maxlen，避免行驶中从前端逐点丢掉像「慢慢缩短」；回仓空闲时整段一次性清空。
+        """
+        if (
+            v.current_task is None
+            and not v.carry_batch
+            and v.busy_until <= self.t + 1e-9
+            and not v.visual_segments
+        ):
+            self._trails[v.vid] = deque()
+
     def _draw(self) -> None:
         self.canvas.delete("all")
         if not self.sim or not self.cfg:
@@ -193,7 +205,7 @@ class FleetVisualApp:
         map_bottom = H - bar_h - legend_h - 10
         inner_w = W - pad * 2
         inner_h = map_bottom - pad * 2
-        cs = max(10.0, min(40.0, min(inner_w / cols, inner_h / rows)))
+        cs = max(3.0, min(38.0, min(inner_w / cols, inner_h / rows)))
 
         gw, gh = cols * cs, rows * cs
         ox = pad + (inner_w - gw) / 2
@@ -286,6 +298,9 @@ class FleetVisualApp:
                 )
 
         for v in sim.vehicles:
+            self._erase_vehicle_path_if_idle_at_depot(sim, v)
+
+        for v in sim.vehicles:
             if v.visual_segments and self.t <= v.busy_until + 1e-9:
                 pts = _flatten_route_points(v.visual_segments, center)
                 if len(pts) >= 2:
@@ -301,7 +316,7 @@ class FleetVisualApp:
 
         for v in sim.vehicles:
             if v.vid not in self._trails:
-                self._trails[v.vid] = deque(maxlen=self._trail_len)
+                self._trails[v.vid] = deque()
             px, py = _vehicle_xy(sim, v, self.t, center)
             tr = self._trails[v.vid]
             if not tr or math.hypot(tr[-1][0] - px, tr[-1][1] - py) > 0.7:
@@ -325,7 +340,7 @@ class FleetVisualApp:
             vx += oxv
             vy += oyv
             col = self._vh[v.vid % len(self._vh)]
-            r = max(5.0, cs * 0.15)
+            r = max(3.5, min(9.0, cs * 0.2))
             self.canvas.create_oval(
                 vx - r,
                 vy - r,
@@ -489,7 +504,7 @@ class FleetVisualApp:
             font=("Microsoft YaHei UI", 8),
         )
 
-        smin, smax = -600.0, 600.0
+        smin, smax = -3000.0, 3000.0
         sc = max(smin, min(smax, sim.score))
         tmid = (bx0 + bx1) / 2
         sx = tmid + (sc / smax) * (gw / 2 - 8)
