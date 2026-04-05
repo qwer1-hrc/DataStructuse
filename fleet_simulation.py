@@ -215,16 +215,35 @@ def pick_batch_greedy_max_weight(
 
 
 class FleetSimulator:
+    @staticmethod
+    def _random_depot_in_center(rows: int, cols: int, rng: random.Random) -> int:
+        """在「中间约三分之一 × 三分之一」的矩形区域内随机选一格作为仓库。"""
+        r_lo = rows // 3
+        r_hi = (2 * rows) // 3
+        c_lo = cols // 3
+        c_hi = (2 * cols) // 3
+        if r_lo >= r_hi:
+            r_lo, r_hi = 0, max(0, rows - 1)
+        else:
+            r_hi = min(r_hi, rows - 1)
+        if c_lo >= c_hi:
+            c_lo, c_hi = 0, max(0, cols - 1)
+        else:
+            c_hi = min(c_hi, cols - 1)
+        r = rng.randint(r_lo, r_hi)
+        c = rng.randint(c_lo, c_hi)
+        return r * cols + c
+
     def __init__(self, cfg: SimConfig):
         self.cfg = cfg
         random.seed(cfg.seed)
+        self._rng = random.Random(cfg.seed)
         self.n, self.adj = build_grid_graph(cfg.rows, cfg.cols)
-        self.depot = 0
+        self.depot = self._random_depot_in_center(cfg.rows, cfg.cols, self._rng)
         self._dist_row_cache: Dict[int, Tuple[List[float], List[int]]] = {}
 
         self.tasks: Dict[int, Task] = {}
         self._next_tid = 0
-        self._rng = random.Random(cfg.seed)
         self.vehicles: List[Vehicle] = []
         for i in range(cfg.num_vehicles):
             self.vehicles.append(
@@ -250,8 +269,8 @@ class FleetSimulator:
         return d[v]
 
     def _place_chargers(self, k: int) -> List[ChargingStation]:
-        """在图中均匀撒点充电站（避开 depot）。"""
-        nodes = list(range(1, self.n))
+        """在图中均匀撒点充电站（避开仓库节点）。"""
+        nodes = [i for i in range(self.n) if i != self.depot]
         self._rng.shuffle(nodes)
         chosen = nodes[:k] if k <= len(nodes) else nodes
         return [
