@@ -71,6 +71,14 @@ class MetaHeuristicFleetSimulator(FleetSimulator):
     def __init__(self, cfg: SimConfig) -> None:
         super().__init__(cfg)
         self._meta_rng = random.Random(cfg.seed + 90_210)
+        # 大惩罚：对“行驶规划失败（常见为电量/可达性不足）”进行重罚
+        self.stranded_penalty = max(2000.0, 80.0 * cfg.late_penalty_per_time)
+        self.stranded_events = 0
+
+    def _apply_stranded_penalty(self, reason: str = "") -> None:
+        _ = reason  # 预留：可扩展写日志/分类型统计
+        self.stranded_events += 1
+        self.score -= self.stranded_penalty
 
     def _route_opt_t0(self) -> float:
         return float(getattr(self, "_route_opt_now", 0.0))
@@ -259,9 +267,52 @@ class MetaHeuristicFleetSimulator(FleetSimulator):
             first = self.tasks[tids[0]]
             if not self._begin_leg_from_to(v, now, v.node, first.node, first.tid):
                 self._rollback_batch(v, tids)
+                self._apply_stranded_penalty("dispatch_leg_failed")
         finally:
             if hasattr(self, "_route_opt_now"):
                 delattr(self, "_route_opt_now")
+
+    def _complete_task_if_due(self, v: Vehicle, now: float) -> None:
+        if v.current_task is None:
+            return
+        if now + 1e-9 < v.busy_until:
+            return
+        task = self.tasks[v.current_task]
+        task.finish_time = now
+        task.status = TaskStatus.DONE
+        v.load_used -= task.weight
+        cfg = self.cfg
+        if now <= task.deadline:
+            self.score += cfg.early_bonus_per_weight * task.weight
+        else:
+            self.score -= cfg.late_penalty_per_time * (now - task.deadline)
+        self.score -= cfg.distance_penalty_coef * task.travel_distance
+
+        v.batch_index += 1
+        if v.batch_index < len(v.carry_batch):
+            next_tid = v.carry_batch[v.batch_index]
+            v.current_task = next_tid
+            nt = self.tasks[next_tid]
+            if not self._begin_leg_from_to(v, now, v.node, nt.node, next_tid):
+                for j in range(v.batch_index, len(v.carry_batch)):
+                    tj = self.tasks[v.carry_batch[j]]
+                    if tj.status == TaskStatus.ASSIGNED:
+                        tj.status = TaskStatus.PENDING
+                        tj.assigned_vehicle = None
+                        v.load_used -= tj.weight
+                v.carry_batch = []
+                v.batch_index = 0
+                v.current_task = None
+                v.visual_segments = []
+                v.battery_segments = []
+                # 失败时车辆保持在当前节点（原地），并施加重罚
+                self._apply_stranded_penalty("in_batch_leg_failed")
+        else:
+            v.carry_batch = []
+            v.batch_index = 0
+            v.current_task = None
+            v.visual_segments = []
+            v.battery_segments = []
 
 
 class MetaHeuristicNearestFleetSimulator(MetaHeuristicFleetSimulator):
@@ -361,6 +412,10 @@ def run_controlled_comparison() -> None:
         print("  --- 元启发式 ---")
         for line in summarize(meta).split("\n"):
             print("   ", line)
+        print(
+            f"    额外惩罚: stranded_events={meta.stranded_events}, "
+            f"单次惩罚={meta.stranded_penalty:.1f}"
+        )
 
         ds = meta.score - base.score
         print(f"  >>> 得分差 (元启发 - 基线): {ds:+.2f}")
