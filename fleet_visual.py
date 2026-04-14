@@ -2,6 +2,7 @@
 """图形界面：沿最短路插值移动、规划虚线、轨迹尾迹、图例。运行: python fleet_visual.py
 
 顶栏「策略」下拉可选：最大任务 / 最近任务（若依赖可用则还有元启发·重量、元启发·最近）。
+点击地图上菱形充电站图标，可弹出当前在该站「充电中 / 排队」的车辆列表。
 """
 
 from __future__ import annotations
@@ -10,9 +11,16 @@ import math
 import tkinter as tk
 from collections import defaultdict, deque
 from tkinter import ttk
-from typing import Callable
+from typing import Callable, Optional
 
-from fleet_simulation import FleetSimulator, SimConfig, TaskStatus, preset_scenarios
+from fleet_simulation import (
+    ChargingStation,
+    FleetSimulator,
+    SimConfig,
+    TaskStatus,
+    format_charger_station_status,
+    preset_scenarios,
+)
 
 SimBuilder = Callable[[SimConfig], FleetSimulator]
 
@@ -109,6 +117,10 @@ def _flatten_route_points(segments: list[tuple[float, float, list[int]]], cxy) -
     return pts
 
 
+_TAG_STATIC = "fv_stat"
+_TAG_DYNAMIC = "fv_dyn"
+
+
 class FleetVisualApp:
     def __init__(
         self,
@@ -159,6 +171,8 @@ class FleetVisualApp:
         self.running = False
         self.steps_per_tick = 1
         self._trails: dict[int, deque[tuple[float, float]]] = {}
+        self._static_sig: object | None = None
+        self._charger_info_win: Optional[tk.Toplevel] = None
 
         self._colors = {
             "bg": "#16161e",
@@ -223,9 +237,51 @@ class FleetVisualApp:
             highlightthickness=0,
         )
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self.canvas.bind("<Button-1>", self._on_canvas_click_charger)
 
         self._restart()
         self._tick_loop()
+
+    def _on_canvas_click_charger(self, event: tk.Event) -> None:
+        if not self.sim or not self.cfg:
+            return
+        pad = max(10.0, min(22.0, self.canvas.winfo_width() * 0.015))
+        x, y = event.x, event.y
+        ids = self.canvas.find_overlapping(x - pad, y - pad, x + pad, y + pad)
+        for cid in reversed(ids):
+            for tag in self.canvas.gettags(cid):
+                if tag.startswith("chg_hit_"):
+                    try:
+                        sid = int(tag[8:])
+                    except ValueError:
+                        continue
+                    for cs in self.sim.chargers:
+                        if cs.sid == sid:
+                            self._popup_charger_info(cs)
+                            return
+
+    def _popup_charger_info(self, cs: ChargingStation) -> None:
+        w = self._charger_info_win
+        if w is not None:
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        tw = tk.Toplevel(self.root)
+        tw.title(f"充电站 #{cs.sid}")
+        tw.transient(self.root)
+        msg = format_charger_station_status(cs, self.t)
+        fr = ttk.Frame(tw, padding=12)
+        fr.pack(fill=tk.BOTH)
+        ttk.Label(fr, text=msg, justify=tk.LEFT).pack(anchor=tk.W)
+
+        def _on_close() -> None:
+            self._charger_info_win = None
+            tw.destroy()
+
+        ttk.Button(fr, text="关闭", command=_on_close).pack(pady=(10, 0), anchor=tk.E)
+        tw.protocol("WM_DELETE_WINDOW", _on_close)
+        self._charger_info_win = tw
 
     def _on_scenario(self, _evt=None) -> None:
         self._restart()
@@ -253,6 +309,8 @@ class FleetVisualApp:
         self.root.title(f"Fleet - {self._current_builder_name}")
         self.t = 0.0
         self._trails = {}
+        self.canvas.delete("all")
+        self._static_sig = None
 
     def _tick_loop(self) -> None:
         if self.sim and self.cfg and self.running and self.t <= self.cfg.sim_duration:
@@ -264,11 +322,8 @@ class FleetVisualApp:
             if self.t > self.cfg.sim_duration:
                 self.running = False
         self._draw()
-        self.root.after(42, self._tick_loop)
-
-    def _node_rc(self, node: int) -> tuple[int, int]:
-        assert self.cfg is not None
-        return node // self.cfg.cols, node % self.cfg.cols
+        delay_ms = 42 if self.running else 200
+        self.root.after(delay_ms, self._tick_loop)
 
     def _erase_vehicle_path_if_idle_at_depot(self, sim: FleetSimulator, v) -> None:
         """
@@ -285,7 +340,6 @@ class FleetVisualApp:
             self._trails[v.vid] = deque()
 
     def _draw(self) -> None:
-        self.canvas.delete("all")
         if not self.sim or not self.cfg:
             return
 
@@ -305,64 +359,259 @@ class FleetVisualApp:
         ox = pad + (inner_w - gw) / 2
         oy = pad + (inner_h - gh) / 2
 
+        ncells = rows * cols
+        centers: list[tuple[float, float]] = [
+            (ox + (i % cols) * cs + cs / 2, oy + (i // cols) * cs + cs / 2) for i in range(ncells)
+        ]
+
         def center(node: int) -> tuple[float, float]:
-            r, c = self._node_rc(node)
-            x = ox + c * cs + cs / 2
-            y = oy + r * cs + cs / 2
-            return x, y
+            return centers[node]
 
         charger_nodes = {csn.node for csn in sim.chargers}
         obstacle_nodes = sim.obstacles if hasattr(sim, "obstacles") else set()
 
-        for r in range(rows + 1):
-            y = oy + r * cs
-            self.canvas.create_line(ox, y, ox + gw, y, fill=self._colors["grid"], width=1)
-        for c in range(cols + 1):
-            x = ox + c * cs
-            self.canvas.create_line(x, oy, x, oy + gh, fill=self._colors["grid"], width=1)
+        static_sig = (
+            W,
+            H,
+            rows,
+            cols,
+            sim.depot,
+            frozenset(obstacle_nodes),
+            frozenset(charger_nodes),
+            self.combo.current(),
+            round(cs, 6),
+            round(ox, 3),
+            round(oy, 3),
+        )
+        if static_sig != self._static_sig:
+            self.canvas.delete(_TAG_STATIC)
+            self._static_sig = static_sig
 
-        for node in range(rows * cols):
-            x0 = ox + (node % cols) * cs + 1
-            y0 = oy + (node // cols) * cs + 1
-            x1 = x0 + cs - 2
-            y1 = y0 + cs - 2
-            fill = self._colors["cell"]
-            if node in obstacle_nodes:
-                fill = self._colors["obstacle"]
-            elif node == sim.depot:
-                fill = self._colors["depot"]
-            elif node in charger_nodes:
-                fill = "#1a3d36"
-            self.canvas.create_rectangle(x0, y0, x1, y1, fill=fill, outline="")
+            for r in range(rows + 1):
+                y = oy + r * cs
+                self.canvas.create_line(
+                    ox, y, ox + gw, y, fill=self._colors["grid"], width=1, tags=(_TAG_STATIC,)
+                )
+            for c in range(cols + 1):
+                x = ox + c * cs
+                self.canvas.create_line(
+                    x, oy, x, oy + gh, fill=self._colors["grid"], width=1, tags=(_TAG_STATIC,)
+                )
 
-        if sim.depot not in charger_nodes:
-            cx, cy = center(sim.depot)
+            for node in range(rows * cols):
+                x0 = ox + (node % cols) * cs + 1
+                y0 = oy + (node // cols) * cs + 1
+                x1 = x0 + cs - 2
+                y1 = y0 + cs - 2
+                fill = self._colors["cell"]
+                if node in obstacle_nodes:
+                    fill = self._colors["obstacle"]
+                elif node == sim.depot:
+                    fill = self._colors["depot"]
+                elif node in charger_nodes:
+                    fill = "#1a3d36"
+                self.canvas.create_rectangle(
+                    x0, y0, x1, y1, fill=fill, outline="", tags=(_TAG_STATIC,)
+                )
+
+            if sim.depot not in charger_nodes:
+                cx, cy = center(sim.depot)
+                self.canvas.create_rectangle(
+                    cx - cs * 0.28,
+                    cy - cs * 0.28,
+                    cx + cs * 0.28,
+                    cy + cs * 0.28,
+                    fill="",
+                    outline=self._colors["depot"],
+                    width=3,
+                    tags=(_TAG_STATIC,),
+                )
+
+            for csn in sim.chargers:
+                cx, cy = center(csn.node)
+                rpoly = cs * 0.22
+                self.canvas.create_polygon(
+                    cx,
+                    cy - rpoly,
+                    cx + rpoly,
+                    cy,
+                    cx,
+                    cy + rpoly,
+                    cx - rpoly,
+                    cy,
+                    fill=self._colors["charger"],
+                    outline="#1a1f2e",
+                    width=1,
+                    tags=(_TAG_STATIC, f"chg_hit_{csn.sid}"),
+                )
+
+            ly0 = map_bottom + 4
+            cy_leg = ly0 + legend_h / 2 - 4
             self.canvas.create_rectangle(
-                cx - cs * 0.28,
-                cy - cs * 0.28,
-                cx + cs * 0.28,
-                cy + cs * 0.28,
-                fill="",
-                outline=self._colors["depot"],
-                width=3,
+                0,
+                ly0,
+                W,
+                ly0 + legend_h - 2,
+                fill=self._colors["legend_bg"],
+                outline="#292e42",
+                width=1,
+                tags=(_TAG_STATIC,),
             )
 
-        for csn in sim.chargers:
-            cx, cy = center(csn.node)
-            r = cs * 0.22
-            self.canvas.create_polygon(
-                cx,
-                cy - r,
-                cx + r,
-                cy,
-                cx,
-                cy + r,
-                cx - r,
-                cy,
-                fill=self._colors["charger"],
-                outline="#1a1f2e",
-                width=1,
+            def leg_item(x: float, draw_fn, text: str) -> None:
+                draw_fn(x, cy_leg)
+                self.canvas.create_text(
+                    x + 22,
+                    cy_leg,
+                    text=text,
+                    fill="#a9b1d6",
+                    font=("Microsoft YaHei UI", 9),
+                    anchor=tk.W,
+                    tags=(_TAG_STATIC,),
+                )
+
+            xi = 12.0
+
+            def d_depot(x: float, cy: float) -> None:
+                self.canvas.create_rectangle(
+                    x,
+                    cy - 8,
+                    x + 16,
+                    cy + 8,
+                    fill=self._colors["depot"],
+                    outline="#1a1b26",
+                    tags=(_TAG_STATIC,),
+                )
+
+            leg_item(xi, d_depot, "仓库")
+            xi += 88
+
+            def d_chg(x: float, cy: float) -> None:
+                self.canvas.create_polygon(
+                    x + 8,
+                    cy - 7,
+                    x + 15,
+                    cy,
+                    x + 8,
+                    cy + 7,
+                    x + 1,
+                    cy,
+                    fill=self._colors["charger"],
+                    outline="#1a1b26",
+                    tags=(_TAG_STATIC,),
+                )
+
+            leg_item(xi, d_chg, "充电站")
+            xi += 100
+
+            def d_obs(x: float, cy: float) -> None:
+                self.canvas.create_rectangle(
+                    x + 1,
+                    cy - 7,
+                    x + 15,
+                    cy + 7,
+                    fill=self._colors["obstacle"],
+                    outline="#1a1b26",
+                    tags=(_TAG_STATIC,),
+                )
+
+            leg_item(xi, d_obs, "障碍物")
+            xi += 100
+
+            def d_pend(x: float, cy: float) -> None:
+                self.canvas.create_oval(
+                    x + 4,
+                    cy - 4,
+                    x + 12,
+                    cy + 4,
+                    fill=self._colors["task_pend"],
+                    outline="",
+                    tags=(_TAG_STATIC,),
+                )
+
+            leg_item(xi, d_pend, "待接任务")
+            xi += 110
+
+            def d_go(x: float, cy: float) -> None:
+                self.canvas.create_oval(
+                    x + 2,
+                    cy - 5,
+                    x + 14,
+                    cy + 5,
+                    outline=self._colors["task_go"],
+                    width=2,
+                    tags=(_TAG_STATIC,),
+                )
+
+            leg_item(xi, d_go, "配送中订单")
+            xi += 130
+
+            def d_car(x: float, cy: float) -> None:
+                self.canvas.create_oval(
+                    x + 2,
+                    cy - 6,
+                    x + 14,
+                    cy + 6,
+                    fill=self._vh[0],
+                    outline="#1a1b26",
+                    width=2,
+                    tags=(_TAG_STATIC,),
+                )
+                self.canvas.create_rectangle(
+                    x + 3,
+                    cy + 7,
+                    x + 13,
+                    cy + 10,
+                    fill="#a6e3a1",
+                    outline="",
+                    tags=(_TAG_STATIC,),
+                )
+
+            leg_item(xi, d_car, "车辆·下为电量")
+            xi += 150
+
+            self.canvas.create_line(
+                xi,
+                cy_leg - 6,
+                xi + 28,
+                cy_leg + 6,
+                fill=self._colors["route"],
+                width=2,
+                dash=(4, 3),
+                tags=(_TAG_STATIC,),
             )
+            self.canvas.create_text(
+                xi + 36,
+                cy_leg,
+                text="规划路径",
+                fill="#a9b1d6",
+                font=("Microsoft YaHei UI", 9),
+                anchor=tk.W,
+                tags=(_TAG_STATIC,),
+            )
+            xi += 110
+
+            self.canvas.create_line(
+                xi,
+                cy_leg,
+                xi + 30,
+                cy_leg,
+                fill=self._colors["trail"],
+                width=3,
+                smooth=True,
+                tags=(_TAG_STATIC,),
+            )
+            self.canvas.create_text(
+                xi + 38,
+                cy_leg,
+                text="已走轨迹",
+                fill="#a9b1d6",
+                font=("Microsoft YaHei UI", 9),
+                anchor=tk.W,
+                tags=(_TAG_STATIC,),
+            )
+
+        self.canvas.delete(_TAG_DYNAMIC)
 
         pending_cnt: dict[int, int] = defaultdict(int)
         for task in sim.tasks.values():
@@ -380,6 +629,7 @@ class FleetVisualApp:
                     cy + math.sin(ang) * 4 + rr / 2,
                     fill=self._colors["task_pend"],
                     outline="",
+                    tags=(_TAG_DYNAMIC,),
                 )
 
         for task in sim.tasks.values():
@@ -392,6 +642,7 @@ class FleetVisualApp:
                     cy + 5,
                     outline=self._colors["task_go"],
                     width=2,
+                    tags=(_TAG_DYNAMIC,),
                 )
 
         for v in sim.vehicles:
@@ -409,12 +660,17 @@ class FleetVisualApp:
                         fill=self._colors["route"],
                         width=2,
                         dash=(5, 5),
+                        tags=(_TAG_DYNAMIC,),
                     )
+
+        v_xy: dict[int, tuple[float, float]] = {}
+        for v in sim.vehicles:
+            v_xy[v.vid] = _vehicle_xy(sim, v, self.t, center)
 
         for v in sim.vehicles:
             if v.vid not in self._trails:
                 self._trails[v.vid] = deque()
-            px, py = _vehicle_xy(sim, v, self.t, center)
+            px, py = v_xy[v.vid]
             tr = self._trails[v.vid]
             if not tr or math.hypot(tr[-1][0] - px, tr[-1][1] - py) > 0.7:
                 tr.append((px, py))
@@ -428,10 +684,11 @@ class FleetVisualApp:
                     width=2,
                     smooth=True,
                     splinesteps=8,
+                    tags=(_TAG_DYNAMIC,),
                 )
 
         for v in sim.vehicles:
-            vx, vy = _vehicle_xy(sim, v, self.t, center)
+            vx, vy = v_xy[v.vid]
             oxv = 6 * math.cos(v.vid * 2.17)
             oyv = 6 * math.sin(v.vid * 2.17)
             vx += oxv
@@ -446,6 +703,7 @@ class FleetVisualApp:
                 fill=col,
                 outline="#1a1b26",
                 width=2,
+                tags=(_TAG_DYNAMIC,),
             )
             cap = cfg.battery_capacity
             cur_bat = _vehicle_battery(v, self.t)
@@ -459,6 +717,7 @@ class FleetVisualApp:
                 vy + r + 2 + bh,
                 fill=self._colors["bar_bg"],
                 outline="",
+                tags=(_TAG_DYNAMIC,),
             )
             hue = "#a6e3a1" if ratio > 0.35 else "#f9e2af" if ratio > 0.15 else "#f7768e"
             self.canvas.create_rectangle(
@@ -468,136 +727,15 @@ class FleetVisualApp:
                 vy + r + 2 + bh,
                 fill=hue,
                 outline="",
+                tags=(_TAG_DYNAMIC,),
             )
-
-        ly0 = map_bottom + 4
-        cy_leg = ly0 + legend_h / 2 - 4
-        self.canvas.create_rectangle(
-            0,
-            ly0,
-            W,
-            ly0 + legend_h - 2,
-            fill=self._colors["legend_bg"],
-            outline="#292e42",
-            width=1,
-        )
-
-        def leg_item(x: float, draw_fn, text: str) -> None:
-            draw_fn(x, cy_leg)
-            self.canvas.create_text(
-                x + 22,
-                cy_leg,
-                text=text,
-                fill="#a9b1d6",
-                font=("Microsoft YaHei UI", 9),
-                anchor=tk.W,
-            )
-
-        xi = 12.0
-
-        def d_depot(x: float, cy: float) -> None:
-            self.canvas.create_rectangle(
-                x,
-                cy - 8,
-                x + 16,
-                cy + 8,
-                fill=self._colors["depot"],
-                outline="#1a1b26",
-            )
-
-        leg_item(xi, d_depot, "仓库")
-        xi += 88
-
-        def d_chg(x: float, cy: float) -> None:
-            self.canvas.create_polygon(
-                x + 8,
-                cy - 7,
-                x + 15,
-                cy,
-                x + 8,
-                cy + 7,
-                x + 1,
-                cy,
-                fill=self._colors["charger"],
-                outline="#1a1b26",
-            )
-
-        leg_item(xi, d_chg, "充电站")
-        xi += 100
-
-        def d_obs(x: float, cy: float) -> None:
-            self.canvas.create_rectangle(
-                x + 1,
-                cy - 7,
-                x + 15,
-                cy + 7,
-                fill=self._colors["obstacle"],
-                outline="#1a1b26",
-            )
-
-        leg_item(xi, d_obs, "障碍物")
-        xi += 100
-
-        def d_pend(x: float, cy: float) -> None:
-            self.canvas.create_oval(x + 4, cy - 4, x + 12, cy + 4, fill=self._colors["task_pend"], outline="")
-
-        leg_item(xi, d_pend, "待接任务")
-        xi += 110
-
-        def d_go(x: float, cy: float) -> None:
-            self.canvas.create_oval(x + 2, cy - 5, x + 14, cy + 5, outline=self._colors["task_go"], width=2)
-
-        leg_item(xi, d_go, "配送中订单")
-        xi += 130
-
-        def d_car(x: float, cy: float) -> None:
-            self.canvas.create_oval(x + 2, cy - 6, x + 14, cy + 6, fill=self._vh[0], outline="#1a1b26", width=2)
-            self.canvas.create_rectangle(x + 3, cy + 7, x + 13, cy + 10, fill="#a6e3a1", outline="")
-
-        leg_item(xi, d_car, "车辆·下为电量")
-        xi += 150
-
-        self.canvas.create_line(
-            xi,
-            cy_leg - 6,
-            xi + 28,
-            cy_leg + 6,
-            fill=self._colors["route"],
-            width=2,
-            dash=(4, 3),
-        )
-        self.canvas.create_text(
-            xi + 36,
-            cy_leg,
-            text="规划路径",
-            fill="#a9b1d6",
-            font=("Microsoft YaHei UI", 9),
-            anchor=tk.W,
-        )
-        xi += 110
-
-        self.canvas.create_line(
-            xi,
-            cy_leg,
-            xi + 30,
-            cy_leg,
-            fill=self._colors["trail"],
-            width=3,
-            smooth=True,
-        )
-        self.canvas.create_text(
-            xi + 38,
-            cy_leg,
-            text="已走轨迹",
-            fill="#a9b1d6",
-            font=("Microsoft YaHei UI", 9),
-            anchor=tk.W,
-        )
 
         bx0, bx1 = ox, ox + gw
         by0 = H - bar_h - 6
         by1 = H - 8
-        self.canvas.create_rectangle(bx0, by0, bx1, by1, fill=self._colors["bar_bg"], outline="")
+        self.canvas.create_rectangle(
+            bx0, by0, bx1, by1, fill=self._colors["bar_bg"], outline="", tags=(_TAG_DYNAMIC,)
+        )
         prog = 0.0 if cfg.sim_duration <= 0 else min(1.0, self.t / cfg.sim_duration)
         self.canvas.create_rectangle(
             bx0,
@@ -606,6 +744,7 @@ class FleetVisualApp:
             by1,
             fill=self._colors["bar_time"],
             outline="",
+            tags=(_TAG_DYNAMIC,),
         )
         self.canvas.create_text(
             (bx0 + bx1) / 2,
@@ -613,6 +752,7 @@ class FleetVisualApp:
             text="仿真进度",
             fill="#565f89",
             font=("Microsoft YaHei UI", 8),
+            tags=(_TAG_DYNAMIC,),
         )
 
         smin, smax = -3000.0, 3000.0
@@ -620,7 +760,9 @@ class FleetVisualApp:
         tmid = (bx0 + bx1) / 2
         sx = tmid + (sc / smax) * (gw / 2 - 8)
         sx = max(bx0 + 4, min(bx1 - 4, sx))
-        self.canvas.create_line(tmid, by0 - 3, tmid, by1 + 3, fill="#414868", width=1)
+        self.canvas.create_line(
+            tmid, by0 - 3, tmid, by1 + 3, fill="#414868", width=1, tags=(_TAG_DYNAMIC,)
+        )
         col = self._colors["bar_pos"] if sc >= 0 else self._colors["bar_neg"]
         self.canvas.create_polygon(
             sx,
@@ -631,6 +773,7 @@ class FleetVisualApp:
             by0 - 12,
             fill=col,
             outline="",
+            tags=(_TAG_DYNAMIC,),
         )
         self.canvas.create_text(
             bx1 - 4,
@@ -639,6 +782,7 @@ class FleetVisualApp:
             fill="#565f89",
             font=("Microsoft YaHei UI", 8),
             anchor=tk.E,
+            tags=(_TAG_DYNAMIC,),
         )
 
 

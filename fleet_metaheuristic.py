@@ -39,6 +39,11 @@ from fleet_rl_max_weight import RLMaxWeightFleetSimulator
 from fleet_visual import FleetVisualApp
 
 
+def _stranded_penalty_value(cfg: SimConfig) -> float:
+    """单次行驶规划失败扣分；与迟到系数挂钩，避免固定超大罚分主导总分。"""
+    return max(120.0, 15.0 * cfg.late_penalty_per_time)
+
+
 def pick_batch_weight_then_edd(
     pending,
     now: float,
@@ -71,8 +76,7 @@ class MetaHeuristicFleetSimulator(FleetSimulator):
     def __init__(self, cfg: SimConfig) -> None:
         super().__init__(cfg)
         self._meta_rng = random.Random(cfg.seed + 90_210)
-        # 大惩罚：对“行驶规划失败（常见为电量/可达性不足）”进行重罚
-        self.stranded_penalty = max(2000.0, 80.0 * cfg.late_penalty_per_time)
+        self.stranded_penalty = _stranded_penalty_value(cfg)
         self.stranded_events = 0
 
     def _apply_stranded_penalty(self, reason: str = "") -> None:
@@ -102,7 +106,7 @@ class MetaHeuristicFleetSimulator(FleetSimulator):
         cum += self._travel_time_for_path(p_back)
         dc = self.cfg.distance_penalty_coef
         lp = self.cfg.late_penalty_per_time
-        return dc * dist_tour + lp * late_sum
+        return dc * self._distance_for_score(dist_tour) + lp * late_sum
 
     def _best_initial_route(self, start_node: int, ts: List[Task]) -> List[Task]:
         """在多种构造解中取代理代价最小者（调用父类最近邻，避免递归）。"""
@@ -243,6 +247,7 @@ class MetaHeuristicFleetSimulator(FleetSimulator):
             pending, now, self.cfg.load_capacity, load_already=0.0
         )
         if not raw:
+            self._try_depot_stranded_charge(v, now)
             return
 
         self._route_opt_now = now
@@ -256,12 +261,13 @@ class MetaHeuristicFleetSimulator(FleetSimulator):
                 ordered.remove(drop)
                 ordered = self._order_tasks_nn(self.depot, ordered)
             if not ordered:
+                self._try_depot_stranded_charge(v, now)
                 return
 
             tour_d = self._tour_distance_with_return([t.node for t in ordered])
             need_tour = self._energy_need(tour_d)
             if need_tour > v.battery + 1e-9:
-                if self._try_proactive_depot_charge(v, now):
+                if self._try_charge_before_dispatch(v, now):
                     return
                 return
 
@@ -298,7 +304,9 @@ class MetaHeuristicFleetSimulator(FleetSimulator):
             self.score += cfg.early_bonus_per_weight * task.weight
         else:
             self.score -= cfg.late_penalty_per_time * (now - task.deadline)
-        self.score -= cfg.distance_penalty_coef * task.travel_distance
+        self.score -= cfg.distance_penalty_coef * self._distance_for_score(
+            task.travel_distance
+        )
 
         v.batch_index += 1
         if v.batch_index < len(v.carry_batch):
@@ -346,6 +354,7 @@ class MetaHeuristicNearestFleetSimulator(MetaHeuristicFleetSimulator):
             pending, now, self.cfg.load_capacity, self, self.depot, load_already=0.0
         )
         if not raw:
+            self._try_depot_stranded_charge(v, now)
             return
 
         self._route_opt_now = now
@@ -359,12 +368,13 @@ class MetaHeuristicNearestFleetSimulator(MetaHeuristicFleetSimulator):
                 ordered.remove(drop)
                 ordered = self._order_tasks_nn(self.depot, ordered)
             if not ordered:
+                self._try_depot_stranded_charge(v, now)
                 return
 
             tour_d = self._tour_distance_with_return([t.node for t in ordered])
             need_tour = self._energy_need(tour_d)
             if need_tour > v.battery + 1e-9:
-                if self._try_proactive_depot_charge(v, now):
+                if self._try_charge_before_dispatch(v, now):
                     return
                 return
 
@@ -382,6 +392,7 @@ class MetaHeuristicNearestFleetSimulator(MetaHeuristicFleetSimulator):
             first = self.tasks[tids[0]]
             if not self._begin_leg_from_to(v, now, v.node, first.node, first.tid):
                 self._rollback_batch(v, tids)
+                self._apply_stranded_penalty("dispatch_leg_failed")
         finally:
             if hasattr(self, "_route_opt_now"):
                 delattr(self, "_route_opt_now")

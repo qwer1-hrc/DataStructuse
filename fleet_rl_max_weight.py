@@ -56,7 +56,7 @@ def _route_proxy_cost(
     cum += sim._travel_time(sim.dist_uv(node, sim.depot))
     dc = sim.cfg.distance_penalty_coef
     lp = sim.cfg.late_penalty_per_time
-    return dc * dist_tour + lp * late_sum
+    return dc * sim._distance_for_score(dist_tour) + lp * late_sum
 
 
 def _feature_row(
@@ -321,6 +321,7 @@ class RLMaxWeightFleetSimulator(FleetSimulator):
             pending, now, self.cfg.load_capacity, load_already=0.0
         )
         if not raw:
+            self._try_depot_stranded_charge(v, now)
             return
 
         self._route_opt_now = now
@@ -334,12 +335,13 @@ class RLMaxWeightFleetSimulator(FleetSimulator):
                 ordered.remove(drop)
                 ordered = self._order_tasks_nn(self.depot, ordered)
             if not ordered:
+                self._try_depot_stranded_charge(v, now)
                 return
 
             tour_d = self._tour_distance_with_return([t.node for t in ordered])
             need_tour = self._energy_need(tour_d)
             if need_tour > v.battery + 1e-9:
-                if self._try_proactive_depot_charge(v, now):
+                if self._try_charge_before_dispatch(v, now):
                     return
                 return
 

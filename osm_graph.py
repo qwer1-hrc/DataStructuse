@@ -124,6 +124,27 @@ def load_segments_csv(path: str) -> List[Segment]:
     return out
 
 
+def load_segments_from_map_edges_csv(path: str) -> List[Segment]:
+    """
+    读取 ``osm_map_export`` 各规模目录下的 ``map_edges.csv``
+    （列含 lon_u, lat_u, lon_v, lat_v），转为 :class:`Segment` 列表供 ``RoadGraph`` 使用。
+    """
+    out: List[Segment] = []
+    with open(path, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            out.append(
+                Segment(
+                    float(row["lon_u"]),
+                    float(row["lat_u"]),
+                    float(row["lon_v"]),
+                    float(row["lat_v"]),
+                    str(row.get("highway", "") or ""),
+                )
+            )
+    return out
+
+
 Node = Tuple[float, float]
 
 

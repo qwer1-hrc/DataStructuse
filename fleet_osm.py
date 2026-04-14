@@ -8,6 +8,8 @@
 
 可视化: python fleet_osm.py（可加 --csv、可选 --seed）
 批量跑分: python fleet_osm_scores.py（可加 --csv；默认三档 seed 21/22/23，多次运行同一 CSV 可复现）
+
+Overpass 超时或网络失败时，自动尝试读取仓库内 ``osm_map_export/<OSM_SMALL|OSM_MEDIUM|OSM_LARGE>/map_edges.csv``。
 """
 
 from __future__ import annotations
@@ -17,14 +19,17 @@ import math
 import random
 import sys
 import tkinter as tk
+import urllib.error
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
+from pathlib import Path
 from tkinter import ttk
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Type
 
 from fleet_metaheuristic import (
     MetaHeuristicFleetSimulator,
     MetaHeuristicNearestFleetSimulator,
+    _stranded_penalty_value,
 )
 from fleet_nearest_first import FleetSimulatorNearestFirst
 from fleet_simulation import (
@@ -35,6 +40,7 @@ from fleet_simulation import (
     TaskStatus,
     Vehicle,
     dijkstra,
+    format_charger_station_status,
     summarize,
 )
 from fleet_visual import _flatten_route_points, _vehicle_battery, _vehicle_xy
@@ -45,6 +51,7 @@ from osm_graph import (
     fetch_overpass,
     haversine_m,
     load_segments_csv,
+    load_segments_from_map_edges_csv,
     segments_from_osm_json,
 )
 
@@ -92,7 +99,8 @@ def _osm_sim_config(
         charge_power=19.0,
         early_bonus_per_weight=9.0,
         late_penalty_per_time=14.0,
-        distance_penalty_coef=0.008,
+        # 与 _distance_for_score（米→千米）配套：8 * d_km 等价于原先 0.008 * d_m
+        distance_penalty_coef=8.0,
         obstacle_cover_ratio=0.0,
         seed=seed,
     )
@@ -437,7 +445,7 @@ class MetaHeuristicFleetSimulatorRoad(MetaHeuristicFleetSimulator):
     def __init__(self, cfg: SimConfig, prep: PreparedRoad) -> None:
         populate_road_fleet_state(self, cfg, prep)
         self._meta_rng = random.Random(cfg.seed + 90_210)
-        self.stranded_penalty = max(2000.0, 80.0 * cfg.late_penalty_per_time)
+        self.stranded_penalty = _stranded_penalty_value(cfg)
         self.stranded_events = 0
 
 
@@ -449,7 +457,7 @@ class MetaHeuristicNearestFleetSimulatorRoad(MetaHeuristicNearestFleetSimulator)
     def __init__(self, cfg: SimConfig, prep: PreparedRoad) -> None:
         populate_road_fleet_state(self, cfg, prep)
         self._meta_rng = random.Random(cfg.seed + 90_210)
-        self.stranded_penalty = max(2000.0, 80.0 * cfg.late_penalty_per_time)
+        self.stranded_penalty = _stranded_penalty_value(cfg)
         self.stranded_events = 0
 
 
@@ -459,6 +467,42 @@ OSM_SIM_BUILDERS: Dict[str, Type[FleetSimulator]] = {
     "元启发·重量": MetaHeuristicFleetSimulatorRoad,
     "元启发·最近": MetaHeuristicNearestFleetSimulatorRoad,
 }
+
+
+OSM_MAP_EXPORT_DIR = Path(__file__).resolve().parent / "osm_map_export"
+
+
+def _load_osm_segments_for_preset(
+    p: OSMMapPreset,
+    *,
+    map_export_root: Optional[Path] = None,
+) -> List[Segment]:
+    """
+    优先从 Overpass 拉取 bbox 内路网；失败时若存在
+    ``<map_export_root>/<p.name>/map_edges.csv`` 则读本地（与导出脚本列名一致）。
+    """
+    root = OSM_MAP_EXPORT_DIR if map_export_root is None else map_export_root
+    local = root / p.name / "map_edges.csv"
+    try:
+        data = fetch_overpass(build_overpass_query(p.south, p.west, p.north, p.east))
+        return segments_from_osm_json(data)
+    except (
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+        ConnectionError,
+    ) as exc:
+        if not local.is_file():
+            raise RuntimeError(
+                f"Overpass 请求失败且无本地路网备份（缺少 {local}）。"
+                f" 原始错误: {type(exc).__name__}: {exc}"
+            ) from exc
+        print(
+            f"提示: Overpass 不可用（{type(exc).__name__}），改用本地路网: {local}",
+            file=sys.stderr,
+        )
+        return load_segments_from_map_edges_csv(str(local))
 
 
 def _print_osm_score_matrix(
@@ -484,17 +528,14 @@ def _print_osm_score_matrix(
         print(line)
 
 
-def load_osm_segments_bbox(south: float, west: float, north: float, east: float) -> List[Segment]:
-    data = fetch_overpass(build_overpass_query(south, west, north, east))
-    return segments_from_osm_json(data)
-
-
 def build_scenario_triples_from_presets(
     presets: Sequence[OSMMapPreset],
     segments_override: Optional[List[Segment]],
+    *,
+    map_export_root: Optional[Path] = None,
 ) -> List[Tuple[str, PreparedRoad, SimConfig]]:
     """
-    联网：每档独立拉 bbox 并构图。
+    联网：每档独立拉 bbox 并构图；失败时按 ``map_export_root/<预设名>/map_edges.csv`` 回退。
     CSV：三档共用同一 segments_override，仅 SimConfig 不同（地图几何相同、负载不同）。
     """
     out: List[Tuple[str, PreparedRoad, SimConfig]] = []
@@ -502,7 +543,7 @@ def build_scenario_triples_from_presets(
         if segments_override is not None:
             segs = segments_override
         else:
-            segs = load_osm_segments_bbox(p.south, p.west, p.north, p.east)
+            segs = _load_osm_segments_for_preset(p, map_export_root=map_export_root)
         prep = prepare_road_network(
             segs,
             random.Random(p.cfg.seed + 17_017),
@@ -515,6 +556,11 @@ def build_scenario_triples_from_presets(
 # 轨迹点过多时 Tk 折线 + smooth 会极慢；限制长度并避免超长 smooth
 _TRAIL_DEQUE_MAXLEN = 420
 _TRAIL_SAMPLE_DIST = 1.25
+
+_TAG_OSM_EDGE = "osm_edge"
+_TAG_OSM_FIX = "osm_fix"
+_TAG_OSM_LEG = "osm_leg"
+_TAG_OSM_DYN = "osm_dyn"
 
 
 class FleetOSMVisualApp:
@@ -609,9 +655,59 @@ class FleetOSMVisualApp:
             highlightthickness=0,
         )
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self.canvas.bind("<Button-1>", self._on_canvas_click_charger)
+
+        self._charger_info_win: Optional[tk.Toplevel] = None
+        self._map_geom_key: Optional[Tuple[int, int, int]] = None
+        self._edge_items: List[Tuple[int, int, int]] = []
+        self._draw_ox = 12.0
+        self._draw_oy = 12.0
+        self._draw_pw = 1000.0
+        self._draw_ph = 600.0
 
         self._restart()
         self._tick_loop()
+
+    def _on_canvas_click_charger(self, event: tk.Event) -> None:
+        if not self.sim:
+            return
+        pad = 14.0
+        x, y = event.x, event.y
+        ids = self.canvas.find_overlapping(x - pad, y - pad, x + pad, y + pad)
+        for cid in reversed(ids):
+            for tag in self.canvas.gettags(cid):
+                if tag.startswith("chg_hit_"):
+                    try:
+                        sid = int(tag[8:])
+                    except ValueError:
+                        continue
+                    for cs in self.sim.chargers:
+                        if cs.sid == sid:
+                            self._popup_charger_info(cs)
+                            return
+
+    def _popup_charger_info(self, cs: ChargingStation) -> None:
+        w = self._charger_info_win
+        if w is not None:
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        tw = tk.Toplevel(self.root)
+        tw.title(f"充电站 #{cs.sid}")
+        tw.transient(self.root)
+        msg = format_charger_station_status(cs, self.t)
+        fr = ttk.Frame(tw, padding=12)
+        fr.pack(fill=tk.BOTH)
+        ttk.Label(fr, text=msg, justify=tk.LEFT).pack(anchor=tk.W)
+
+        def _on_close() -> None:
+            self._charger_info_win = None
+            tw.destroy()
+
+        ttk.Button(fr, text="关闭", command=_on_close).pack(pady=(10, 0), anchor=tk.E)
+        tw.protocol("WM_DELETE_WINDOW", _on_close)
+        self._charger_info_win = tw
 
     def _new_sim(self) -> FleetSimulator:
         cls = OSM_SIM_BUILDERS[self._builder_key]
@@ -636,15 +732,7 @@ class FleetOSMVisualApp:
 
     def _cxy(self, node: int) -> Tuple[float, float]:
         lon, lat = self.sim.node_lonlat[node]
-        W = int(self.canvas.cget("width"))
-        H = int(self.canvas.cget("height"))
-        bar_h = self._bar_h
-        leg_h = self._leg_h
-        pad = 12
-        pw = W - 2 * pad
-        ph = H - bar_h - leg_h - 2 * pad
-        ox, oy = pad, pad
-        return self._project(lon, lat, ox, oy, pw, ph)
+        return self._project(lon, lat, self._draw_ox, self._draw_oy, self._draw_pw, self._draw_ph)
 
     def _on_scenario(self, _evt=None) -> None:
         idx = self.combo.current()
@@ -677,8 +765,135 @@ class FleetOSMVisualApp:
         self.sim = self._new_sim()
         self.t = 0.0
         self._trails = defaultdict(lambda: deque(maxlen=_TRAIL_DEQUE_MAXLEN))
+        self.canvas.delete("all")
+        self._map_geom_key = None
         name = self.scenarios[self._scenario_idx][0]
         self.root.title(f"OSM 车队 · {name} · {self._builder_key}")
+
+    def _rebuild_osm_canvas_static(
+        self,
+        sim: FleetSimulator,
+        prep: PreparedRoad,
+        W: int,
+        H: int,
+        ox: float,
+        oy: float,
+        pw: float,
+        ph: float,
+    ) -> None:
+        self.canvas.delete(_TAG_OSM_EDGE, _TAG_OSM_FIX, _TAG_OSM_LEG)
+        self._edge_items.clear()
+        seen: Set[Tuple[int, int]] = set()
+        for u in range(sim.n):
+            lon_u, lat_u = sim.node_lonlat[u]
+            x0, y0 = self._project(lon_u, lat_u, ox, oy, pw, ph)
+            for v, _w in sim.adj[u]:
+                if u < v:
+                    a, b = u, v
+                else:
+                    a, b = v, u
+                if (a, b) in seen:
+                    continue
+                seen.add((a, b))
+                lon_v, lat_v = sim.node_lonlat[v]
+                x1, y1 = self._project(lon_v, lat_v, ox, oy, pw, ph)
+                dense = prep.edge_congest_base.get((a, b), 0.35)
+                lvl = _edge_congest_visual_level(
+                    dense, self.t, self._congest_period, a, b
+                )
+                ec = _edge_color_for_congest_level(lvl)
+                cid = self.canvas.create_line(
+                    x0, y0, x1, y1, fill=ec, width=1, tags=(_TAG_OSM_EDGE,)
+                )
+                self._edge_items.append((cid, a, b))
+
+        cx_d, cy_d = self._project(
+            *sim.node_lonlat[sim.depot], ox, oy, pw, ph
+        )
+        self.canvas.create_rectangle(
+            cx_d - 9,
+            cy_d - 9,
+            cx_d + 9,
+            cy_d + 9,
+            fill=self._colors["depot"],
+            outline="#1a1b26",
+            width=2,
+            tags=(_TAG_OSM_FIX,),
+        )
+
+        for csn in sim.chargers:
+            cx, cy = self._project(
+                *sim.node_lonlat[csn.node], ox, oy, pw, ph
+            )
+            r = 7.0
+            self.canvas.create_polygon(
+                cx,
+                cy - r,
+                cx + r,
+                cy,
+                cx,
+                cy + r,
+                cx - r,
+                cy,
+                fill=self._colors["charger"],
+                outline="#1a1f2e",
+                tags=(_TAG_OSM_FIX, f"chg_hit_{csn.sid}"),
+            )
+
+        leg_h = self._leg_h
+        ly = H - leg_h + 2
+        self.canvas.create_rectangle(
+            0, ly, W, H - 2, fill="#1a1b26", outline="#292e42", tags=(_TAG_OSM_LEG,)
+        )
+        self.canvas.create_text(
+            14,
+            ly + 11,
+            text="■仓库  ◆充电  ·待接  ○配送中  —规划  |  路网颜色=道路拥挤度（疏→青灰，密/高峰→红，随仿真时间周期变化）",
+            fill="#a9b1d6",
+            font=("Microsoft YaHei UI", 8),
+            anchor=tk.W,
+            tags=(_TAG_OSM_LEG,),
+        )
+        lx_leg = W - 200
+        self.canvas.create_text(
+            lx_leg,
+            ly + 28,
+            text="拥挤度",
+            fill="#787c99",
+            font=("Microsoft YaHei UI", 7),
+            anchor=tk.W,
+            tags=(_TAG_OSM_LEG,),
+        )
+        for i in range(12):
+            ti = i / 11.0
+            x0 = lx_leg + i * 15
+            self.canvas.create_rectangle(
+                x0,
+                ly + 32,
+                x0 + 13,
+                ly + 44,
+                fill=_edge_color_for_congest_level(ti),
+                outline="#292e42",
+                tags=(_TAG_OSM_LEG,),
+            )
+        self.canvas.create_text(
+            lx_leg,
+            ly + 50,
+            text="低（畅通）",
+            fill="#565f89",
+            font=("Microsoft YaHei UI", 7),
+            anchor=tk.W,
+            tags=(_TAG_OSM_LEG,),
+        )
+        self.canvas.create_text(
+            lx_leg + 168,
+            ly + 50,
+            text="高（拥挤）",
+            fill="#565f89",
+            font=("Microsoft YaHei UI", 7),
+            anchor=tk.E,
+            tags=(_TAG_OSM_LEG,),
+        )
 
     def _tick_loop(self) -> None:
         cfg = self.cfg
@@ -706,7 +921,6 @@ class FleetOSMVisualApp:
             self._trails[v.vid].clear()
 
     def _draw(self) -> None:
-        self.canvas.delete("all")
         sim = self.sim
         cfg = self.cfg
         W = int(self.canvas.cget("width"))
@@ -714,60 +928,28 @@ class FleetOSMVisualApp:
         bar_h = self._bar_h
         leg_h = self._leg_h
         pad = 12
-        pw = W - 2 * pad
-        ph = H - bar_h - leg_h - 2 * pad
-        ox, oy = pad, pad
+        self._draw_ox = float(pad)
+        self._draw_oy = float(pad)
+        self._draw_pw = float(W - 2 * pad)
+        self._draw_ph = float(H - bar_h - leg_h - 2 * pad)
+        ox, oy = self._draw_ox, self._draw_oy
+        pw, ph = self._draw_pw, self._draw_ph
 
-        w0, s0, e0, n0 = self._bounds
-
-        seen: Set[Tuple[int, int]] = set()
         prep = self.prep
-        for u in range(sim.n):
-            lon_u, lat_u = sim.node_lonlat[u]
-            x0, y0 = self._project(lon_u, lat_u, ox, oy, pw, ph)
-            for v, _w in sim.adj[u]:
-                if u < v:
-                    a, b = u, v
-                else:
-                    a, b = v, u
-                if (a, b) in seen:
-                    continue
-                seen.add((a, b))
-                lon_v, lat_v = sim.node_lonlat[v]
-                x1, y1 = self._project(lon_v, lat_v, ox, oy, pw, ph)
-                dense = prep.edge_congest_base.get((a, b), 0.35)
-                lvl = _edge_congest_visual_level(
-                    dense, self.t, self._congest_period, a, b
-                )
-                ec = _edge_color_for_congest_level(lvl)
-                self.canvas.create_line(x0, y0, x1, y1, fill=ec, width=1)
+        geom_key = (W, H, id(prep))
+        if geom_key != self._map_geom_key:
+            self._rebuild_osm_canvas_static(sim, prep, W, H, ox, oy, pw, ph)
+            self._map_geom_key = geom_key
 
-        cx_d, cy_d = self._cxy(sim.depot)
-        self.canvas.create_rectangle(
-            cx_d - 9,
-            cy_d - 9,
-            cx_d + 9,
-            cy_d + 9,
-            fill=self._colors["depot"],
-            outline="#1a1b26",
-            width=2,
-        )
-
-        for csn in sim.chargers:
-            cx, cy = self._cxy(csn.node)
-            r = 7.0
-            self.canvas.create_polygon(
-                cx,
-                cy - r,
-                cx + r,
-                cy,
-                cx,
-                cy + r,
-                cx - r,
-                cy,
-                fill=self._colors["charger"],
-                outline="#1a1f2e",
+        for cid, a, b in self._edge_items:
+            dense = prep.edge_congest_base.get((a, b), 0.35)
+            lvl = _edge_congest_visual_level(
+                dense, self.t, self._congest_period, a, b
             )
+            ec = _edge_color_for_congest_level(lvl)
+            self.canvas.itemconfig(cid, fill=ec)
+
+        self.canvas.delete(_TAG_OSM_DYN)
 
         pending_cnt: Dict[int, int] = defaultdict(int)
         for task in sim.tasks.values():
@@ -777,9 +959,13 @@ class FleetOSMVisualApp:
             elif st == TaskStatus.ASSIGNED:
                 px, py = self._cxy(task.node)
                 self.canvas.create_oval(
-                    px - 6, py - 6, px + 6, py + 6,
+                    px - 6,
+                    py - 6,
+                    px + 6,
+                    py + 6,
                     outline=self._colors["task_go"],
                     width=2,
+                    tags=(_TAG_OSM_DYN,),
                 )
         for node, k in pending_cnt.items():
             px, py = self._cxy(node)
@@ -793,6 +979,7 @@ class FleetOSMVisualApp:
                     py + math.sin(ang) * 5 + rr / 2,
                     fill=self._colors["task_pend"],
                     outline="",
+                    tags=(_TAG_OSM_DYN,),
                 )
 
         for v in sim.vehicles:
@@ -810,11 +997,16 @@ class FleetOSMVisualApp:
                         fill=self._colors["route"],
                         width=2,
                         dash=(5, 4),
+                        tags=(_TAG_OSM_DYN,),
                     )
+
+        v_xy: Dict[int, Tuple[float, float]] = {}
+        for v in sim.vehicles:
+            v_xy[v.vid] = _vehicle_xy(sim, v, self.t, self._cxy)
 
         for v in sim.vehicles:
             tr = self._trails[v.vid]
-            px, py = _vehicle_xy(sim, v, self.t, self._cxy)
+            px, py = v_xy[v.vid]
             if not tr or math.hypot(tr[-1][0] - px, tr[-1][1] - py) > _TRAIL_SAMPLE_DIST:
                 tr.append((px, py))
             if len(tr) >= 2:
@@ -828,21 +1020,39 @@ class FleetOSMVisualApp:
                     width=2,
                     smooth=use_smooth,
                     splinesteps=8 if use_smooth else 12,
+                    tags=(_TAG_OSM_DYN,),
                 )
 
         for v in sim.vehicles:
-            vx, vy = _vehicle_xy(sim, v, self.t, self._cxy)
+            vx, vy = v_xy[v.vid]
             oxv = 7 * math.cos(v.vid * 2.1)
             oyv = 7 * math.sin(v.vid * 2.1)
             vx += oxv
             vy += oyv
             col = self._vh[v.vid % len(self._vh)]
-            self.canvas.create_oval(vx - 7, vy - 7, vx + 7, vy + 7, fill=col, outline="#1a1b26", width=2)
+            self.canvas.create_oval(
+                vx - 7,
+                vy - 7,
+                vx + 7,
+                vy + 7,
+                fill=col,
+                outline="#1a1b26",
+                width=2,
+                tags=(_TAG_OSM_DYN,),
+            )
             cap = cfg.battery_capacity
             cur_bat = _vehicle_battery(v, self.t)
             ratio = max(0.0, min(1.0, cur_bat / cap))
             bw, bh = 28.0, 4.0
-            self.canvas.create_rectangle(vx - bw / 2, vy + 9, vx + bw / 2, vy + 9 + bh, fill="#24283b", outline="")
+            self.canvas.create_rectangle(
+                vx - bw / 2,
+                vy + 9,
+                vx + bw / 2,
+                vy + 9 + bh,
+                fill="#24283b",
+                outline="",
+                tags=(_TAG_OSM_DYN,),
+            )
             hue = "#a6e3a1" if ratio > 0.35 else "#f9e2af" if ratio > 0.15 else "#f7768e"
             self.canvas.create_rectangle(
                 vx - bw / 2,
@@ -851,62 +1061,33 @@ class FleetOSMVisualApp:
                 vy + 9 + bh,
                 fill=hue,
                 outline="",
+                tags=(_TAG_OSM_DYN,),
             )
-
-        ly = H - leg_h + 2
-        self.canvas.create_rectangle(0, ly, W, H - 2, fill="#1a1b26", outline="#292e42")
-        self.canvas.create_text(
-            14,
-            ly + 11,
-            text="■仓库  ◆充电  ·待接  ○配送中  —规划  |  路网颜色=道路拥挤度（疏→青灰，密/高峰→红，随仿真时间周期变化）",
-            fill="#a9b1d6",
-            font=("Microsoft YaHei UI", 8),
-            anchor=tk.W,
-        )
-        lx_leg = W - 200
-        self.canvas.create_text(
-            lx_leg,
-            ly + 28,
-            text="拥挤度",
-            fill="#787c99",
-            font=("Microsoft YaHei UI", 7),
-            anchor=tk.W,
-        )
-        for i in range(12):
-            ti = i / 11.0
-            x0 = lx_leg + i * 15
-            self.canvas.create_rectangle(
-                x0,
-                ly + 32,
-                x0 + 13,
-                ly + 44,
-                fill=_edge_color_for_congest_level(ti),
-                outline="#292e42",
-            )
-        self.canvas.create_text(
-            lx_leg,
-            ly + 50,
-            text="低（畅通）",
-            fill="#565f89",
-            font=("Microsoft YaHei UI", 7),
-            anchor=tk.W,
-        )
-        self.canvas.create_text(
-            lx_leg + 168,
-            ly + 50,
-            text="高（拥挤）",
-            fill="#565f89",
-            font=("Microsoft YaHei UI", 7),
-            anchor=tk.E,
-        )
 
         bx0, bx1 = pad, W - pad
         by0 = H - bar_h + 6
         by1 = H - 6
-        self.canvas.create_rectangle(bx0, by0, bx1, by1, fill=self._colors["bar_bg"], outline="")
+        self.canvas.create_rectangle(
+            bx0, by0, bx1, by1, fill=self._colors["bar_bg"], outline="", tags=(_TAG_OSM_DYN,)
+        )
         prog = 0.0 if cfg.sim_duration <= 0 else min(1.0, self.t / cfg.sim_duration)
-        self.canvas.create_rectangle(bx0, by0, bx0 + (bx1 - bx0) * prog, by1, fill=self._colors["bar_time"], outline="")
-        self.canvas.create_text((bx0 + bx1) / 2, (by0 + by1) / 2, text="仿真进度", fill="#565f89", font=("Microsoft YaHei UI", 8))
+        self.canvas.create_rectangle(
+            bx0,
+            by0,
+            bx0 + (bx1 - bx0) * prog,
+            by1,
+            fill=self._colors["bar_time"],
+            outline="",
+            tags=(_TAG_OSM_DYN,),
+        )
+        self.canvas.create_text(
+            (bx0 + bx1) / 2,
+            (by0 + by1) / 2,
+            text="仿真进度",
+            fill="#565f89",
+            font=("Microsoft YaHei UI", 8),
+            tags=(_TAG_OSM_DYN,),
+        )
 
         sc = max(-8000.0, min(8000.0, sim.score))
         tmid = (bx0 + bx1) / 2
@@ -914,9 +1095,30 @@ class FleetOSMVisualApp:
         smax = 4000.0
         sx = tmid + (sc / smax) * (gw / 2 - 16)
         sx = max(bx0 + 6, min(bx1 - 6, sx))
-        self.canvas.create_line(tmid, by0 - 2, tmid, by1 + 2, fill="#414868")
+        self.canvas.create_line(
+            tmid, by0 - 2, tmid, by1 + 2, fill="#414868", tags=(_TAG_OSM_DYN,)
+        )
         col = self._colors["bar_pos"] if sc >= 0 else self._colors["bar_neg"]
-        self.canvas.create_polygon(sx, by0 - 4, sx - 4, by0 - 11, sx + 4, by0 - 11, fill=col, outline="")
+        self.canvas.create_polygon(
+            sx,
+            by0 - 4,
+            sx - 4,
+            by0 - 11,
+            sx + 4,
+            by0 - 11,
+            fill=col,
+            outline="",
+            tags=(_TAG_OSM_DYN,),
+        )
+        self.canvas.create_text(
+            bx1 - 4,
+            by0 - 14,
+            text="得分",
+            fill="#565f89",
+            font=("Microsoft YaHei UI", 8),
+            anchor=tk.E,
+            tags=(_TAG_OSM_DYN,),
+        )
 
 
 def run_osm_console_score_batch(scenarios: List[Tuple[str, PreparedRoad, SimConfig]]) -> None:

@@ -74,6 +74,7 @@ class FleetSimulatorNearestFirst(FleetSimulator):
             pending, now, self.cfg.load_capacity, self, self.depot, load_already=0.0
         )
         if not raw:
+            self._try_depot_stranded_charge(v, now)
             return
 
         ordered = self._order_tasks_nn(self.depot, raw)
@@ -85,12 +86,13 @@ class FleetSimulatorNearestFirst(FleetSimulator):
             ordered.remove(drop)
             ordered = self._order_tasks_nn(self.depot, ordered)
         if not ordered:
+            self._try_depot_stranded_charge(v, now)
             return
 
         tour_d = self._tour_distance_with_return([t.node for t in ordered])
         need_tour = self._energy_need(tour_d)
         if need_tour > v.battery + 1e-9:
-            if self._try_proactive_depot_charge(v, now):
+            if self._try_charge_before_dispatch(v, now):
                 return
             return
 
