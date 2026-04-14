@@ -9,7 +9,9 @@
 可视化: python fleet_osm.py（可加 --csv、可选 --seed）
 批量跑分: python fleet_osm_scores.py（可加 --csv；默认三档 seed 21/22/23，多次运行同一 CSV 可复现）
 
-Overpass 超时或网络失败时，自动尝试读取仓库内 ``osm_map_export/<OSM_SMALL|OSM_MEDIUM|OSM_LARGE>/map_edges.csv``。
+Overpass 超时或网络失败时，自动尝试读取仓库内
+``osm_export_csv/<OSM_SMALL|OSM_MEDIUM|OSM_LARGE>_map_nodes.csv`` 与
+``osm_export_csv/<OSM_SMALL|OSM_MEDIUM|OSM_LARGE>_map_edges.csv``。
 """
 
 from __future__ import annotations
@@ -51,7 +53,7 @@ from osm_graph import (
     fetch_overpass,
     haversine_m,
     load_segments_csv,
-    load_segments_from_map_edges_csv,
+    load_segments_from_export_csv,
     segments_from_osm_json,
 )
 
@@ -469,22 +471,40 @@ OSM_SIM_BUILDERS: Dict[str, Type[FleetSimulator]] = {
 }
 
 
-OSM_MAP_EXPORT_DIR = Path(__file__).resolve().parent / "osm_map_export"
+OSM_EXPORT_CSV_DIR = Path(__file__).resolve().parent / "osm_export_csv"
+
+
+def _load_local_segments_for_preset(
+    p: OSMMapPreset,
+    *,
+    export_csv_root: Optional[Path] = None,
+) -> List[Segment]:
+    root = OSM_EXPORT_CSV_DIR if export_csv_root is None else export_csv_root
+    local_nodes = root / f"{p.name}_map_nodes.csv"
+    local_edges = root / f"{p.name}_map_edges.csv"
+    if not local_nodes.is_file() or not local_edges.is_file():
+        raise RuntimeError(
+            f"本地路网备份缺失（需要 {local_nodes} 与 {local_edges}）。"
+        )
+    return load_segments_from_export_csv(str(local_nodes), str(local_edges))
 
 
 def _load_osm_segments_for_preset(
     p: OSMMapPreset,
     *,
-    map_export_root: Optional[Path] = None,
+    export_csv_root: Optional[Path] = None,
+    raise_on_online_fail: bool = False,
 ) -> List[Segment]:
     """
     优先从 Overpass 拉取 bbox 内路网；失败时若存在
-    ``<map_export_root>/<p.name>/map_edges.csv`` 则读本地（与导出脚本列名一致）。
+    ``<export_csv_root>/<p.name>_map_nodes.csv`` 与
+    ``<export_csv_root>/<p.name>_map_edges.csv`` 则读本地。
     """
-    root = OSM_MAP_EXPORT_DIR if map_export_root is None else map_export_root
-    local = root / p.name / "map_edges.csv"
     try:
-        data = fetch_overpass(build_overpass_query(p.south, p.west, p.north, p.east))
+        data = fetch_overpass(
+            build_overpass_query(p.south, p.west, p.north, p.east),
+            total_timeout_s=10.0,
+        )
         return segments_from_osm_json(data)
     except (
         urllib.error.HTTPError,
@@ -493,16 +513,20 @@ def _load_osm_segments_for_preset(
         OSError,
         ConnectionError,
     ) as exc:
-        if not local.is_file():
-            raise RuntimeError(
-                f"Overpass 请求失败且无本地路网备份（缺少 {local}）。"
-                f" 原始错误: {type(exc).__name__}: {exc}"
-            ) from exc
+        if raise_on_online_fail:
+            raise
         print(
-            f"提示: Overpass 不可用（{type(exc).__name__}），改用本地路网: {local}",
+            f"提示: Overpass 不可用（{type(exc).__name__}），改用本地路网: "
+            f"{p.name}_map_nodes.csv + {p.name}_map_edges.csv",
             file=sys.stderr,
         )
-        return load_segments_from_map_edges_csv(str(local))
+        try:
+            return _load_local_segments_for_preset(p, export_csv_root=export_csv_root)
+        except Exception as e:
+            raise RuntimeError(
+                "Overpass 请求失败且无本地路网可用。"
+                f" 原始错误: {type(exc).__name__}: {exc}; 本地读取错误: {e}"
+            ) from exc
 
 
 def _print_osm_score_matrix(
@@ -532,18 +556,43 @@ def build_scenario_triples_from_presets(
     presets: Sequence[OSMMapPreset],
     segments_override: Optional[List[Segment]],
     *,
-    map_export_root: Optional[Path] = None,
+    export_csv_root: Optional[Path] = None,
 ) -> List[Tuple[str, PreparedRoad, SimConfig]]:
     """
-    联网：每档独立拉 bbox 并构图；失败时按 ``map_export_root/<预设名>/map_edges.csv`` 回退。
+    联网：按预设拉 bbox 并构图；若某一档在线失败，
+    本次后续档位将直接走本地 CSV，避免重复等待联网超时。
     CSV：三档共用同一 segments_override，仅 SimConfig 不同（地图几何相同、负载不同）。
     """
     out: List[Tuple[str, PreparedRoad, SimConfig]] = []
+    force_local_for_rest = False
     for p in presets:
         if segments_override is not None:
             segs = segments_override
+        elif force_local_for_rest:
+            segs = _load_local_segments_for_preset(p, export_csv_root=export_csv_root)
         else:
-            segs = _load_osm_segments_for_preset(p, map_export_root=map_export_root)
+            try:
+                segs = _load_osm_segments_for_preset(
+                    p,
+                    export_csv_root=export_csv_root,
+                    raise_on_online_fail=True,
+                )
+            except (
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+                ConnectionError,
+            ) as exc:
+                print(
+                    "提示: 首次 Overpass 失败后，后续场景本次运行将直接使用本地 CSV。"
+                    f" 触发场景: {p.name}; 错误: {type(exc).__name__}",
+                    file=sys.stderr,
+                )
+                segs = _load_local_segments_for_preset(
+                    p, export_csv_root=export_csv_root
+                )
+                force_local_for_rest = True
         prep = prepare_road_network(
             segs,
             random.Random(p.cfg.seed + 17_017),

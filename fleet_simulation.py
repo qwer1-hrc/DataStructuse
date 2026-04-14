@@ -400,6 +400,110 @@ class FleetSimulator:
     def _energy_need(self, distance: float) -> float:
         return distance * self.cfg.energy_per_distance
 
+    def _path_congestion_level(self, path: List[int]) -> float:
+        """
+        估计一条路径的拥堵程度 [0,1]。
+        OSM 路网优先用 edge_congest_base；普通网格图退化为中性值。
+        """
+        if len(path) < 2:
+            return 0.0
+        m = getattr(self, "edge_congest_base", None)
+        if not m:
+            return 0.35
+        vals: List[float] = []
+        for i in range(len(path) - 1):
+            a, b = path[i], path[i + 1]
+            u, v = (a, b) if a < b else (b, a)
+            vals.append(float(m.get((u, v), 0.35)))
+        if not vals:
+            return 0.35
+        return max(0.0, min(1.0, sum(vals) / float(len(vals))))
+
+    def _dynamic_recharge_threshold(self, node: int) -> float:
+        """
+        动态低电阈值（电量低于此值则优先补能）：
+        - 与“回仓距离耗电”正相关；
+        - 与“回仓路径拥堵程度”正相关；
+        - 受电池容量上下限约束，避免过于激进/保守。
+        """
+        cap = self.cfg.battery_capacity
+        d_back = self.dist_uv(node, self.depot)
+        if math.isinf(d_back):
+            return cap * 0.92
+        e_back = self._energy_need(d_back)
+        p_back = self._path_nodes(node, self.depot)
+        congest = self._path_congestion_level(p_back)
+        reserve = cap * (0.10 + 0.20 * congest)
+        dyn = e_back * (1.05 + 0.70 * congest) + reserve
+        return min(cap * 0.92, max(cap * 0.18, dyn))
+
+    def _charger_rank_key(
+        self,
+        cs: ChargingStation,
+        from_node: int,
+        now: float,
+    ) -> Optional[Tuple[int, float, float, int]]:
+        """
+        充电站排序规则（按你的要求）：
+        1) 是否有空位（到达即充优先）
+        2) 充电点距离（越近越优先）
+        其后再按最早开始时间与站点 id 稳定排序。
+        """
+        d1 = self.dist_uv(from_node, cs.node)
+        if math.isinf(d1):
+            return None
+        p1 = self._path_nodes(from_node, cs.node)
+        t_arrive = now + self._travel_time_for_path(p1)
+        busy_arrive = len(self._charging_sessions_covering(cs, t_arrive))
+        has_slot = 1 if busy_arrive < cs.slots else 0
+        charge_start = self._next_charge_start(cs, t_arrive)
+        # has_slot 越大越好，排序时转为 0(有空位) / 1(无空位)
+        return (0 if has_slot else 1, d1, charge_start, cs.sid)
+
+    def _try_charge_detour(self, v: Vehicle, now: float, anchor_node: int) -> bool:
+        """
+        从 anchor_node 出发补电后回到 anchor_node（不中断后续任务顺序）。
+        """
+        best = self._best_charger_plan(anchor_node, anchor_node, now, v.battery)
+        if best is None:
+            return False
+        station, cnode, d1, d2 = best
+        e1 = self._energy_need(d1)
+        p1 = self._path_nodes(anchor_node, cnode)
+        p2 = self._path_nodes(cnode, anchor_node)
+        t_arrive_c = now + self._travel_time_for_path(p1)
+        b0 = v.battery
+        bat1 = b0 - e1
+        charge_start, charge_end = self._reserve_charge(station, v.vid, t_arrive_c, bat1)
+        bat_after = self.cfg.battery_capacity
+        e2 = self._energy_need(d2)
+        if e2 > bat_after + 1e-9:
+            self._cancel_last_session(station)
+            return False
+
+        t_end = charge_end + self._travel_time_for_path(p2)
+        v.visual_segments = []
+        if p1:
+            v.visual_segments.append((now, t_arrive_c, p1))
+        v.visual_segments.append((t_arrive_c, charge_end, [cnode, cnode]))
+        if p2:
+            v.visual_segments.append((charge_end, t_end, p2))
+
+        b_leg1 = bat1
+        b_leg2_start = bat_after
+        b_final = bat_after - e2
+        bsegs: List[Tuple[float, float, float, float]] = [(now, t_arrive_c, b0, b_leg1)]
+        if charge_start > t_arrive_c + 1e-9:
+            bsegs.append((t_arrive_c, charge_start, b_leg1, b_leg1))
+        if charge_end > charge_start + 1e-9:
+            bsegs.append((charge_start, charge_end, b_leg1, b_leg2_start))
+        bsegs.append((charge_end, t_end, b_leg2_start, b_final))
+        v.battery_segments = bsegs
+        v.battery = b_final
+        v.node = anchor_node
+        v.busy_until = t_end
+        return True
+
     def _station_on_node(self, node: int) -> Optional[ChargingStation]:
         for cs in self.chargers:
             if cs.node == node:
@@ -567,12 +671,13 @@ class FleetSimulator:
         battery_now: float,
     ) -> Optional[Tuple[ChargingStation, int, float, float]]:
         """
-        选择使“到达目的地时刻”最小的充电站，代价包含：
-        行驶到站 + 排队等待 + 充电时间 + 充后行驶到目标。
-        对仍挂在该站上的预约数加温和惩罚，减轻多车挤占单站。
+        选站优先级：
+        1) 到达时是否有空位（有空位优先）
+        2) 到站距离（近者优先）
+        在满足可达与可行约束下再比较预计抵达目的地时刻。
         """
         best: Optional[Tuple[ChargingStation, int, float, float]] = None
-        best_arrival = math.inf
+        best_key: Optional[Tuple[int, float, float, int, float]] = None
 
         for cs in self.chargers:
             cnode = cs.node
@@ -599,12 +704,12 @@ class FleetSimulator:
                 continue
 
             arrival = charge_end + self._travel_time_for_path(p2)
-            # 预约队列越长略增惩罚，避免多车为略短路程挤同一站而远处站空闲
-            backlog = sum(1 for s in cs.active if s.until > now + 1e-9)
-            balance = 14.0 * math.sqrt(float(backlog))
-            effective = arrival + balance
-            if effective < best_arrival:
-                best_arrival = effective
+            base_rank = self._charger_rank_key(cs, from_node, now)
+            if base_rank is None:
+                continue
+            rank = (base_rank[0], base_rank[1], base_rank[2], base_rank[3], arrival)
+            if best_key is None or rank < best_key:
+                best_key = rank
                 best = (cs, cnode, d1, d2)
 
         return best
@@ -643,17 +748,14 @@ class FleetSimulator:
         if not reachable:
             return False
 
-        def proactive_pick_key(cs: ChargingStation) -> Tuple[float, float, int]:
-            """最早能插上充电的时刻优先；同刻则略偏好预约少的站，再比路程。"""
-            p1 = self._path_nodes(self.depot, cs.node)
-            t_tr = self._travel_time_for_path(p1)
-            t_arrive = now + t_tr
-            charge_slot = self._next_charge_start(cs, t_arrive)
-            backlog = sum(1 for s in cs.active if s.until > now + 1e-9)
-            d1 = self.dist_uv(self.depot, cs.node)
-            return (charge_slot, 0.08 * backlog, d1, cs.sid)
-
-        station = min(reachable, key=proactive_pick_key)
+        ranked = [
+            (self._charger_rank_key(cs, self.depot, now), cs)
+            for cs in reachable
+        ]
+        ranked = [(rk, cs) for rk, cs in ranked if rk is not None]
+        if not ranked:
+            return False
+        station = min(ranked, key=lambda item: item[0])[1]
         cnode = station.node
         d1 = self.dist_uv(self.depot, cnode)
         d2 = self.dist_uv(cnode, self.depot)
@@ -823,6 +925,10 @@ class FleetSimulator:
             next_tid = v.carry_batch[v.batch_index]
             v.current_task = next_tid
             nt = self.tasks[next_tid]
+            # 有载配送过程中：若电量低于动态阈值，先做一次“就地补电后回到当前点”再继续派送
+            if v.battery <= self._dynamic_recharge_threshold(v.node) + 1e-9:
+                if self._try_charge_detour(v, now, v.node):
+                    return
             if not self._begin_leg_from_to(v, now, v.node, nt.node, next_tid):
                 for j in range(v.batch_index, len(v.carry_batch)):
                     tj = self.tasks[v.carry_batch[j]]

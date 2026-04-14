@@ -8,8 +8,8 @@
 
 from __future__ import annotations
 
-import csv
 import json
+import csv
 import math
 import sys
 import urllib.error
@@ -27,9 +27,7 @@ OVERPASS_URLS = (
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass-api.de/api/interpreter",
 )
-
 OUT_CSV = "osm_sample_segments.csv"
-
 
 @dataclass(frozen=True)
 class Segment:

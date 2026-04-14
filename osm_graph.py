@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -56,10 +57,20 @@ out geom;
 """
 
 
-def fetch_overpass(query: str, urls: Sequence[str] = OVERPASS_URLS) -> Dict[str, Any]:
+def fetch_overpass(
+    query: str,
+    urls: Sequence[str] = OVERPASS_URLS,
+    *,
+    total_timeout_s: float = 90.0,
+) -> Dict[str, Any]:
     body = urllib.parse.urlencode({"data": query}).encode("utf-8")
     last_err: Optional[BaseException] = None
+    deadline = time.monotonic() + max(float(total_timeout_s), 0.0)
     for url in urls:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            last_err = TimeoutError(f"Overpass 拉取超时（>{total_timeout_s:.1f}s）")
+            break
         req = urllib.request.Request(
             url,
             data=body,
@@ -70,7 +81,7 @@ def fetch_overpass(query: str, urls: Sequence[str] = OVERPASS_URLS) -> Dict[str,
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=90) as resp:
+            with urllib.request.urlopen(req, timeout=max(0.1, remaining)) as resp:
                 raw = resp.read()
             return json.loads(raw.decode("utf-8"))
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as e:
@@ -142,6 +153,46 @@ def load_segments_from_map_edges_csv(path: str) -> List[Segment]:
                     str(row.get("highway", "") or ""),
                 )
             )
+    return out
+
+
+def load_segments_from_export_csv(nodes_path: str, edges_path: str) -> List[Segment]:
+    """
+    读取 ``osm_export_csv`` 的 ``*_map_nodes.csv`` 与 ``*_map_edges.csv``，
+    将 (u,v) 边恢复为经纬度线段，转为 :class:`Segment` 列表供 ``RoadGraph`` 使用。
+    """
+    nodes: Dict[int, Tuple[float, float]] = {}
+    with open(nodes_path, newline="", encoding="utf-8-sig") as f_nodes:
+        r_nodes = csv.DictReader(f_nodes)
+        for row in r_nodes:
+            node_raw = (
+                row.get("node")
+                or row.get("node_id")
+                or row.get("\ufeffnode")
+                or row.get("\ufeffnode_id")
+            )
+            if node_raw is None:
+                continue
+            node = int(node_raw)
+            lon = float(row.get("lon") or row.get("\ufefflon") or "")
+            lat = float(row.get("lat") or row.get("\ufefflat") or "")
+            nodes[node] = (lon, lat)
+
+    out: List[Segment] = []
+    with open(edges_path, newline="", encoding="utf-8-sig") as f_edges:
+        r_edges = csv.DictReader(f_edges)
+        for row in r_edges:
+            u_raw = row.get("u") or row.get("\ufeffu")
+            v_raw = row.get("v") or row.get("\ufeffv")
+            if u_raw is None or v_raw is None:
+                continue
+            u = int(u_raw)
+            v = int(v_raw)
+            pu = nodes.get(u)
+            pv = nodes.get(v)
+            if pu is None or pv is None:
+                continue
+            out.append(Segment(pu[0], pu[1], pv[0], pv[1], ""))
     return out
 
 
